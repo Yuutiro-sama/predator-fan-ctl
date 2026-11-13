@@ -1,0 +1,10 @@
+pub mod chart_window;
+pub mod config;
+pub mod curve;
+pub mod curve_dialog;
+pub mod fan_backend;
+pub mod governor;
+pub mod scm;
+pub mod sensor;
+pub mod telemetry;
+pub mod tray;

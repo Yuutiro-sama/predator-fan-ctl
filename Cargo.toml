@@ -1,0 +1,31 @@
+[package]
+name = "predator-fan-ctl"
+version = "1.0.0"
+edition = "2021"
+
+[lib]
+name = "predator_fan_ctl"
+path = "src/lib.rs"
+
+[[bin]]
+name = "predator-fan-ctl"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+wmi = "0.14"
+
+[dependencies.windows]
+version = "0.58"
+features = ["Win32_Foundation", "Win32_System_Services", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Console", "Win32_System_Wmi", "Win32_Security", "Win32_System_Variant", "Win32_System_Ole", "Win32_System_Power", "Win32_System_Registry"]
+
+[build-dependencies]
+embed-resource = "2.4"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,48 @@
+poll_interval_ms = 1000
+backend = "wmi" # "wmi" hoặc "ec"
+manage_predator_service = false # Để false để không can thiệp AASSvc, giữ nguyên đèn Tím (Performance) / Tím thẫm (Turbo) và công suất GPU 140W
+service_name = "PredatorSenseService"
+
+# Cấu hình địa chỉ thanh ghi EC cho Acer Predator (sử dụng khi backend = "ec")
+[ec_registers]
+cpu_fan_mode_reg = 0x21
+cpu_fan_speed_reg = 0x37
+gpu_fan_mode_reg = 0x22
+gpu_fan_speed_reg = 0x3A
+
+# Khóa nhiệt độ CPU mục tiêu (Dynamic Smooth EPP Thermal Governor - Zero Stuttering)
+[thermal_governor]
+enabled = true
+target_cpu_temp = 80
+tolerance = 3
+max_epp = 50
+min_throttle_pct = 55
+
+# Fan curve phản ứng tức thì (Zero-Hysteresis): [Nhiệt độ (°C), Tốc độ quạt (%)]
+[[cpu_curve]]
+temp = 40
+speed = 20
+
+[[cpu_curve]]
+temp = 60
+speed = 50
+
+[[cpu_curve]]
+temp = 75
+speed = 80
+
+[[cpu_curve]]
+temp = 85
+speed = 100
+
+[[gpu_curve]]
+temp = 45
+speed = 25
+
+[[gpu_curve]]
+temp = 65
+speed = 60
+
+[[gpu_curve]]
+temp = 80
+speed = 100
