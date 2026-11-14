@@ -221,16 +221,26 @@ pub fn find_button_at(buttons: &[TactileButton], pt: POINT) -> Option<ButtonId> 
     None
 }
 
-/// Tính toán bố cục các nút bấm dựa theo kích thước Client Area
-pub fn compute_button_layout(
+/// Bố cục động hoàn chỉnh của Dashboard (Cards, Panels và Buttons)
+#[derive(Debug, Clone)]
+pub struct DashboardLayout {
+    pub card_cpu_rect: RECT,
+    pub card_gpu_rect: RECT,
+    pub epp_panel_rect: RECT,
+    pub buttons: Vec<TactileButton>,
+}
+
+/// Tính toán toàn bộ bố cục Dashboard đáp ứng linh hoạt theo kích thước cửa sổ (Responsive Layout)
+pub fn compute_dashboard_layout(
     width: i32,
-    _height: i32,
+    height: i32,
     snapshot: &DashboardSnapshot,
     _theme: AppTheme,
     hovered: Option<ButtonId>,
     pressed: Option<ButtonId>,
-) -> Vec<TactileButton> {
-    let mut buttons = Vec::with_capacity(9);
+) -> DashboardLayout {
+    let w = width.max(480);
+    let h = height.max(400);
 
     let get_state = |id: ButtonId| -> ButtonState {
         if pressed == Some(id) {
@@ -244,11 +254,104 @@ pub fn compute_button_layout(
 
     // 1. Nút đổi Giao diện (Header Theme Toggle)
     let theme_btn_rect = RECT {
-        left: width - 110,
+        left: w - 110,
         top: 10,
-        right: width - 16,
+        right: w - 16,
         bottom: 38,
     };
+
+    // Phân bổ chiều dọc linh hoạt (Responsive Vertical Distribution)
+    let available_content = (h - 48 - 16).max(340);
+    let card_h = (available_content * 33 / 100).clamp(130, 240);
+    let card_bottom = 48 + card_h;
+
+    let base_gap = ((available_content - (card_h + 38 + 38 + 78)) / 4).clamp(6, 20);
+
+    let prof_y_top = card_bottom + base_gap;
+    let prof_h = (available_content * 9 / 100).clamp(36, 48);
+    let prof_y_bottom = prof_y_top + prof_h;
+
+    let epp_y_top = prof_y_bottom + base_gap;
+    let epp_h = prof_h;
+    let epp_y_bottom = epp_y_top + epp_h;
+
+    let tools_y_top = epp_y_bottom + base_gap;
+    let tool_row_h = prof_h;
+    let tool_gap = (base_gap / 2).max(4);
+    let tool_r1_top = tools_y_top;
+    let tool_r1_bottom = tool_r1_top + tool_row_h;
+    let tool_r2_top = tool_r1_bottom + tool_gap;
+    let tool_r2_bottom = tool_r2_top + tool_row_h;
+
+    // --- Cards Rect ---
+    let card_gap = 12;
+    let card_w = (w - 32 - card_gap) / 2;
+    let card_cpu_rect = RECT {
+        left: 16,
+        top: 48,
+        right: 16 + card_w,
+        bottom: card_bottom,
+    };
+    let card_gpu_rect = RECT {
+        left: 16 + card_w + card_gap,
+        top: 48,
+        right: w - 16,
+        bottom: card_bottom,
+    };
+
+    // --- Profiles Buttons ---
+    let prof_gap = 8;
+    let prof_width = (w - 32 - (prof_gap * 2)) / 3;
+    let p1_rect = RECT {
+        left: 16,
+        top: prof_y_top,
+        right: 16 + prof_width,
+        bottom: prof_y_bottom,
+    };
+    let p2_rect = RECT {
+        left: 16 + prof_width + prof_gap,
+        top: prof_y_top,
+        right: 16 + (prof_width * 2) + prof_gap,
+        bottom: prof_y_bottom,
+    };
+    let p3_rect = RECT {
+        left: 16 + (prof_width * 2) + (prof_gap * 2),
+        top: prof_y_top,
+        right: w - 16,
+        bottom: prof_y_bottom,
+    };
+
+    // --- EPP Panel & Toggle Button ---
+    let epp_panel_rect = RECT {
+        left: 16,
+        top: epp_y_top,
+        right: w - 16,
+        bottom: epp_y_bottom,
+    };
+    let epp_btn_h = 28.min(epp_h - 8);
+    let epp_btn_top = epp_y_top + (epp_h - epp_btn_h) / 2;
+    let epp_btn_rect = RECT {
+        left: w - 16 - 130,
+        top: epp_btn_top,
+        right: w - 24,
+        bottom: epp_btn_top + epp_btn_h,
+    };
+    let epp_label = if snapshot.governor_enabled {
+        format!("BẬT ({}°C)", snapshot.governor_target_temp)
+    } else {
+        "TẮT".to_string()
+    };
+
+    // --- Tools Grid ---
+    let half_w = w / 2;
+    let grid_gap = 10;
+    let col1_left = 16;
+    let col1_right = half_w - (grid_gap / 2);
+    let col2_left = half_w + (grid_gap / 2);
+    let col2_right = w - 16;
+
+    let mut buttons = Vec::with_capacity(9);
+
     buttons.push(TactileButton {
         id: ButtonId::ToggleTheme,
         rect: theme_btn_rect,
@@ -258,18 +361,6 @@ pub fn compute_button_layout(
         is_danger: false,
     });
 
-    // 2. Hàng 3 nút Chọn Profile Quạt (Y: 198..238, cao 40px)
-    let profile_y_top = 198;
-    let profile_y_bottom = 238;
-    let prof_gap = 8;
-    let prof_width = (width - 32 - (prof_gap * 2)) / 3;
-
-    let p1_rect = RECT {
-        left: 16,
-        top: profile_y_top,
-        right: 16 + prof_width,
-        bottom: profile_y_bottom,
-    };
     buttons.push(TactileButton {
         id: ButtonId::ProfileCurve,
         rect: p1_rect,
@@ -279,12 +370,6 @@ pub fn compute_button_layout(
         is_danger: false,
     });
 
-    let p2_rect = RECT {
-        left: 16 + prof_width + prof_gap,
-        top: profile_y_top,
-        right: 16 + (prof_width * 2) + prof_gap,
-        bottom: profile_y_bottom,
-    };
     buttons.push(TactileButton {
         id: ButtonId::ProfileTurbo,
         rect: p2_rect,
@@ -294,12 +379,6 @@ pub fn compute_button_layout(
         is_danger: false,
     });
 
-    let p3_rect = RECT {
-        left: 16 + (prof_width * 2) + (prof_gap * 2),
-        top: profile_y_top,
-        right: width - 16,
-        bottom: profile_y_bottom,
-    };
     buttons.push(TactileButton {
         id: ButtonId::ProfileSilent,
         rect: p3_rect,
@@ -309,18 +388,6 @@ pub fn compute_button_layout(
         is_danger: false,
     });
 
-    // 3. Nút Toggle Khóa Nhiệt độ CPU (Smooth EPP) (Y: 248..288, bên trong Panel)
-    let epp_btn_rect = RECT {
-        left: width - 16 - 130,
-        top: 253,
-        right: width - 24,
-        bottom: 283,
-    };
-    let epp_label = if snapshot.governor_enabled {
-        format!("BẬT ({}°C)", snapshot.governor_target_temp)
-    } else {
-        "TẮT".to_string()
-    };
     buttons.push(TactileButton {
         id: ButtonId::ToggleEpp,
         rect: epp_btn_rect,
@@ -330,22 +397,13 @@ pub fn compute_button_layout(
         is_danger: false,
     });
 
-    // 4. Lưới 4 nút Công cụ & Hành động (Y: 298..382)
-    let half_w = width / 2;
-    let grid_gap = 10;
-    let col1_left = 16;
-    let col1_right = half_w - (grid_gap / 2);
-    let col2_left = half_w + (grid_gap / 2);
-    let col2_right = width - 16;
-
-    // Hàng 1 (Y: 298..336)
     buttons.push(TactileButton {
         id: ButtonId::OpenCurveEditor,
         rect: RECT {
             left: col1_left,
-            top: 298,
+            top: tool_r1_top,
             right: col1_right,
-            bottom: 336,
+            bottom: tool_r1_bottom,
         },
         label: "⚙ Tự chỉnh Curve".to_string(),
         state: get_state(ButtonId::OpenCurveEditor),
@@ -357,9 +415,9 @@ pub fn compute_button_layout(
         id: ButtonId::OpenTelemetryChart,
         rect: RECT {
             left: col2_left,
-            top: 298,
+            top: tool_r1_top,
             right: col2_right,
-            bottom: 336,
+            bottom: tool_r1_bottom,
         },
         label: "📈 Biểu đồ 1 Giờ".to_string(),
         state: get_state(ButtonId::OpenTelemetryChart),
@@ -367,14 +425,13 @@ pub fn compute_button_layout(
         is_danger: false,
     });
 
-    // Hàng 2 (Y: 344..382)
     buttons.push(TactileButton {
         id: ButtonId::ReloadConfig,
         rect: RECT {
             left: col1_left,
-            top: 344,
+            top: tool_r2_top,
             right: col1_right,
-            bottom: 382,
+            bottom: tool_r2_bottom,
         },
         label: "🔄 Tải lại Config".to_string(),
         state: get_state(ButtonId::ReloadConfig),
@@ -386,9 +443,9 @@ pub fn compute_button_layout(
         id: ButtonId::ExitApp,
         rect: RECT {
             left: col2_left,
-            top: 344,
+            top: tool_r2_top,
             right: col2_right,
-            bottom: 382,
+            bottom: tool_r2_bottom,
         },
         label: "✕ Thoát ứng dụng".to_string(),
         state: get_state(ButtonId::ExitApp),
@@ -396,7 +453,24 @@ pub fn compute_button_layout(
         is_danger: true,
     });
 
-    buttons
+    DashboardLayout {
+        card_cpu_rect,
+        card_gpu_rect,
+        epp_panel_rect,
+        buttons,
+    }
+}
+
+/// Tính toán bố cục các nút bấm dựa theo kích thước Client Area
+pub fn compute_button_layout(
+    width: i32,
+    height: i32,
+    snapshot: &DashboardSnapshot,
+    theme: AppTheme,
+    hovered: Option<ButtonId>,
+    pressed: Option<ButtonId>,
+) -> Vec<TactileButton> {
+    compute_dashboard_layout(width, height, snapshot, theme, hovered, pressed).buttons
 }
 
 /// Mở hoặc đưa cửa sổ Dashboard lên phía trước (Singleton Handle)
@@ -461,7 +535,7 @@ fn run_dashboard_window(
         let pos_x = (screen_w - width) / 2;
         let pos_y = (screen_h - height) / 2;
 
-        let window_style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+        let window_style = WS_OVERLAPPEDWINDOW;
 
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
@@ -634,7 +708,7 @@ unsafe fn paint_dashboard(
     width: i32,
     height: i32,
     state: &DashboardWindowState,
-    buttons: &[TactileButton],
+    layout: &DashboardLayout,
     snapshot: &DashboardSnapshot,
 ) {
     let palette = state.theme.palette();
@@ -670,17 +744,8 @@ unsafe fn paint_dashboard(
         draw_text_line(hdc, 270, 16, "✓ Đã tải lại cấu hình!", rgb(76, 175, 80));
     }
 
-    // 3. Telemetry Cards (CPU & GPU) (Y: 48..188, cao 140px)
-    let card_gap = 12;
-    let card_w = (width - 32 - card_gap) / 2;
-
-    // --- CPU Card ---
-    let cpu_card_rect = RECT {
-        left: 16,
-        top: 48,
-        right: 16 + card_w,
-        bottom: 188,
-    };
+    // 3. Telemetry Cards (CPU & GPU) từ Layout động
+    let cpu_card_rect = layout.card_cpu_rect;
     let card_pen = CreatePen(PS_SOLID, 1, palette.border);
     let card_brush = CreateSolidBrush(palette.card);
     let old_pen = SelectObject(hdc, card_pen);
@@ -697,12 +762,7 @@ unsafe fn paint_dashboard(
     );
 
     // --- GPU Card ---
-    let gpu_card_rect = RECT {
-        left: 16 + card_w + card_gap,
-        top: 48,
-        right: width - 16,
-        bottom: 188,
-    };
+    let gpu_card_rect = layout.card_gpu_rect;
     let _ = RoundRect(
         hdc,
         gpu_card_rect.left,
@@ -727,12 +787,14 @@ unsafe fn paint_dashboard(
     let cpu_temp_str = format!("{}°C", snapshot.cpu_temp);
     draw_text_line(hdc, cpu_card_rect.left + 14, cpu_card_rect.top + 34, &cpu_temp_str, palette.cpu);
 
-    // Thanh Bar quạt CPU
+    // Thanh Bar quạt CPU (Tính toán vị trí tương đối theo chiều cao card)
+    let cpu_card_h = cpu_card_rect.bottom - cpu_card_rect.top;
+    let track_rel_y = (cpu_card_h * 58 / 100).max(80);
     let cpu_track_rect = RECT {
         left: cpu_card_rect.left + 14,
-        top: cpu_card_rect.top + 88,
+        top: cpu_card_rect.top + track_rel_y,
         right: cpu_card_rect.right - 14,
-        bottom: cpu_card_rect.top + 100,
+        bottom: cpu_card_rect.top + track_rel_y + 12,
     };
     let track_brush = CreateSolidBrush(palette.bar_bg);
     FillRect(hdc, &cpu_track_rect, track_brush);
@@ -757,7 +819,7 @@ unsafe fn paint_dashboard(
     } else {
         format!("Quạt: {}%", snapshot.cpu_speed)
     };
-    draw_text_line(hdc, cpu_card_rect.left + 14, cpu_card_rect.top + 108, &cpu_info, palette.text_sec);
+    draw_text_line(hdc, cpu_card_rect.left + 14, cpu_card_rect.top + track_rel_y + 18, &cpu_info, palette.text_sec);
 
     // Nội dung GPU Card
     let _ = SelectObject(hdc, font_card_header);
@@ -768,11 +830,13 @@ unsafe fn paint_dashboard(
     draw_text_line(hdc, gpu_card_rect.left + 14, gpu_card_rect.top + 34, &gpu_temp_str, palette.gpu);
 
     // Thanh Bar quạt GPU
+    let gpu_card_h = gpu_card_rect.bottom - gpu_card_rect.top;
+    let gpu_track_rel_y = (gpu_card_h * 58 / 100).max(80);
     let gpu_track_rect = RECT {
         left: gpu_card_rect.left + 14,
-        top: gpu_card_rect.top + 88,
+        top: gpu_card_rect.top + gpu_track_rel_y,
         right: gpu_card_rect.right - 14,
-        bottom: gpu_card_rect.top + 100,
+        bottom: gpu_card_rect.top + gpu_track_rel_y + 12,
     };
     FillRect(hdc, &gpu_track_rect, track_brush);
     let _ = DeleteObject(track_brush);
@@ -797,15 +861,10 @@ unsafe fn paint_dashboard(
     } else {
         format!("Quạt: {}%", snapshot.gpu_speed)
     };
-    draw_text_line(hdc, gpu_card_rect.left + 14, gpu_card_rect.top + 108, &gpu_info, palette.text_sec);
+    draw_text_line(hdc, gpu_card_rect.left + 14, gpu_card_rect.top + gpu_track_rel_y + 18, &gpu_info, palette.text_sec);
 
-    // 4. Panel Khóa nhiệt độ CPU (Smooth EPP) (Y: 248..288)
-    let epp_panel_rect = RECT {
-        left: 16,
-        top: 248,
-        right: width - 16,
-        bottom: 288,
-    };
+    // 4. Panel Khóa nhiệt độ CPU (Smooth EPP) từ Layout động
+    let epp_panel_rect = layout.epp_panel_rect;
     let epp_pen = CreatePen(PS_SOLID, 1, palette.border);
     let epp_brush = CreateSolidBrush(palette.card);
     let old_pen = SelectObject(hdc, epp_pen);
@@ -826,17 +885,19 @@ unsafe fn paint_dashboard(
     let _ = DeleteObject(epp_brush);
     let _ = DeleteObject(epp_pen);
 
+    let epp_h = epp_panel_rect.bottom - epp_panel_rect.top;
+    let epp_text_y = epp_panel_rect.top + (epp_h - 16) / 2;
     let _ = SelectObject(hdc, font_body_bold);
     draw_text_line(
         hdc,
         epp_panel_rect.left + 14,
-        epp_panel_rect.top + 11,
+        epp_text_y,
         "Khóa nhiệt độ CPU (Smooth EPP Governor)",
         palette.text,
     );
 
     // 5. Vẽ tất cả các nút bấm xúc giác
-    for btn in buttons {
+    for btn in &layout.buttons {
         draw_tactile_button(hdc, btn, &palette, font_body, font_body_bold);
     }
 
@@ -879,7 +940,7 @@ unsafe extern "system" fn dashboard_wndproc(
                 let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DashboardWindowState;
                 if let Some(state) = ptr.as_ref() {
                     let snapshot = DashboardSnapshot::from_state(&state.state, state.reload_flash_ticks);
-                    let buttons = compute_button_layout(
+                    let layout = compute_dashboard_layout(
                         width,
                         height,
                         &snapshot,
@@ -887,7 +948,7 @@ unsafe extern "system" fn dashboard_wndproc(
                         state.hovered_btn,
                         state.pressed_btn,
                     );
-                    paint_dashboard(hdc_mem, width, height, state, &buttons, &snapshot);
+                    paint_dashboard(hdc_mem, width, height, state, &layout, &snapshot);
                 }
 
                 let _ = BitBlt(hdc_screen, 0, 0, width, height, hdc_mem, 0, 0, SRCCOPY);
@@ -1024,10 +1085,18 @@ unsafe extern "system" fn dashboard_wndproc(
             }
             LRESULT(0)
         }
+        WM_GETMINMAXINFO => {
+            let p_mmi = lparam.0 as *mut MINMAXINFO;
+            if let Some(mmi) = p_mmi.as_mut() {
+                mmi.ptMinTrackSize.x = 480;
+                mmi.ptMinTrackSize.y = 420;
+            }
+            LRESULT(0)
+        }
         WM_SIZE => {
             if wparam.0 as u32 == SIZE_MINIMIZED {
                 let _ = KillTimer(hwnd, IDT_DASHBOARD_REFRESH);
-            } else if wparam.0 as u32 == SIZE_RESTORED {
+            } else {
                 let _ = SetTimer(hwnd, IDT_DASHBOARD_REFRESH, 1000, None);
                 let _ = InvalidateRect(hwnd, None, false);
             }
@@ -1205,5 +1274,64 @@ mod tests {
         assert_eq!(snap.governor_target_temp, 85);
         assert_eq!(snap.governor_epp, 128);
         assert_eq!(snap.reload_flash_ticks, 2);
+    }
+
+    #[test]
+    fn test_responsive_resizing_layout() {
+        let snapshot = DashboardSnapshot {
+            cpu_temp: 70,
+            cpu_speed: 50,
+            gpu_temp: 65,
+            gpu_speed: 45,
+            cpu_rpm: 3400,
+            gpu_rpm: 3200,
+            active_profile: FanProfile::ActiveCurve,
+            governor_enabled: true,
+            governor_target_temp: 85,
+            governor_epp: 96,
+            reload_flash_ticks: 0,
+        };
+
+        // Kiểm tra 3 kích thước: nhỏ nhất (480x420), chuẩn (540x450), và mở rộng lớn (1000x800)
+        let sizes = [(480, 420), (540, 450), (1000, 800)];
+
+        for &(w, h) in &sizes {
+            let layout = compute_dashboard_layout(
+                w,
+                h,
+                &snapshot,
+                AppTheme::Dark,
+                None,
+                None,
+            );
+
+            // 1. Kiểm tra 2 card CPU và GPU
+            assert!(layout.card_cpu_rect.left < layout.card_cpu_rect.right);
+            assert!(layout.card_cpu_rect.top < layout.card_cpu_rect.bottom);
+            assert!(layout.card_gpu_rect.left < layout.card_gpu_rect.right);
+            assert!(layout.card_gpu_rect.top < layout.card_gpu_rect.bottom);
+
+            // Card CPU nằm bên trái Card GPU và không đè lên nhau
+            assert!(layout.card_cpu_rect.right < layout.card_gpu_rect.left);
+
+            // Cả 2 card nằm trong giới hạn màn hình
+            assert!(layout.card_cpu_rect.left >= 16);
+            assert!(layout.card_gpu_rect.right <= w - 16);
+
+            // 2. Kiểm tra EPP Panel
+            assert!(layout.epp_panel_rect.left >= 16);
+            assert!(layout.epp_panel_rect.right <= w - 16);
+            assert!(layout.epp_panel_rect.top >= layout.card_cpu_rect.bottom);
+            assert!(layout.epp_panel_rect.bottom <= h);
+
+            // 3. Kiểm tra số lượng và tính hợp lệ của tất cả các nút
+            assert_eq!(layout.buttons.len(), 9);
+            for btn in &layout.buttons {
+                assert!(btn.rect.left < btn.rect.right, "Nút {:?} có width <= 0", btn.id);
+                assert!(btn.rect.top < btn.rect.bottom, "Nút {:?} có height <= 0", btn.id);
+                assert!(btn.rect.left >= 0 && btn.rect.right <= w, "Nút {:?} vượt biên ngang", btn.id);
+                assert!(btn.rect.top >= 0 && btn.rect.bottom <= h, "Nút {:?} vượt biên dọc", btn.id);
+            }
+        }
     }
 }
