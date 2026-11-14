@@ -189,23 +189,26 @@ fn main() {
             if guard.is_already_running() {
                 println!("[SINGLE-INSTANCE] Một phiên bản khác của Acer Predator Fan Control đã đang chạy!");
                 unsafe {
-                    if let Ok(existing_hwnd) = FindWindowW(
+                    let existing_hwnd = FindWindowW(
                         w!("PredatorFanTrayWindowClass"),
-                        PCWSTR::null(),
-                    ) {
-                        if !existing_hwnd.0.is_null() {
+                        w!("PredatorFanTray"),
+                    ).or_else(|_| FindWindowW(PCWSTR::null(), w!("PredatorFanTray")));
+                    if let Ok(hwnd) = existing_hwnd {
+                        if !hwnd.0.is_null() {
                             let cmd = if std::env::args().any(|a| a == "--chart" || a == "-c") {
                                 predator_fan_ctl::tray::IDM_SHOW_TEMP_CHART
-                            } else {
+                            } else if std::env::args().any(|a| a == "--curve") {
                                 predator_fan_ctl::tray::IDM_CUSTOMIZE_CURVE
+                            } else {
+                                predator_fan_ctl::tray::IDM_OPEN_DASHBOARD
                             };
                             let _ = PostMessageW(
-                                existing_hwnd,
+                                hwnd,
                                 WM_COMMAND,
                                 WPARAM(cmd),
                                 LPARAM(0),
                             );
-                            let _ = SetForegroundWindow(existing_hwnd);
+                            let _ = SetForegroundWindow(hwnd);
                             println!("[SINGLE-INSTANCE] Đã gửi lệnh kích hoạt giao diện (cmd: {cmd}) tới app đang chạy.");
                         }
                     }
@@ -487,9 +490,15 @@ fn main() {
         println!("[FAIL-SAFE] Fans successfully reverted to BIOS default.");
     });
 
-    // 8. Nếu được gọi với cờ --chart, tự động mở cửa sổ biểu đồ nhiệt độ
+    // 8. Nếu được gọi với cờ --chart hoặc --dashboard
     if std::env::args().any(|a| a == "--chart" || a == "-c") {
         predator_fan_ctl::chart_window::show_or_focus_chart_window(telemetry.clone());
+    } else if std::env::args().any(|a| a == "--dashboard" || a == "-d") {
+        predator_fan_ctl::dashboard_window::show_or_focus_dashboard(
+            tray_manager.state(),
+            tray_manager.cmd_sender(),
+            telemetry.clone(),
+        );
     }
 
     // 9. Chạy Win32 Native Message Loop trên Main Thread (GetMessageW - 0% CPU khi không tương tác)

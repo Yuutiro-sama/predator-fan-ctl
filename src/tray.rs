@@ -51,6 +51,7 @@ pub fn load_embedded_app_icon() -> HICON {
 }
 
 /// Menu Item Command IDs
+pub const IDM_OPEN_DASHBOARD: usize = 999;
 pub const IDM_STATUS: usize = 1000;
 pub const IDM_PROFILE_ACTIVE_CURVE: usize = 1001;
 pub const IDM_PROFILE_TURBO: usize = 1002;
@@ -277,6 +278,7 @@ pub struct TrayManager {
     hwnd: HWND,
     hicon: HICON,
     state: Arc<TrayState>,
+    cmd_sender: Sender<TrayCommand>,
     context_ptr: *mut TrayContext,
 }
 
@@ -301,7 +303,7 @@ impl TrayManager {
             let app_icon = load_embedded_app_icon();
 
             let wnd_class = WNDCLASSW {
-                style: WNDCLASS_STYLES::default(),
+                style: CS_GLOBALCLASS,
                 lpfnWndProc: Some(wndproc),
                 cbClsExtra: 0,
                 cbWndExtra: 0,
@@ -332,7 +334,7 @@ impl TrayManager {
 
             let context = Box::new(TrayContext {
                 state: state.clone(),
-                cmd_sender,
+                cmd_sender: cmd_sender.clone(),
                 hwnd,
                 hicon: app_icon,
                 telemetry,
@@ -381,6 +383,7 @@ impl TrayManager {
                 hwnd,
                 hicon: app_icon,
                 state,
+                cmd_sender,
                 context_ptr,
             };
 
@@ -404,6 +407,10 @@ impl TrayManager {
 
     pub fn state(&self) -> Arc<TrayState> {
         self.state.clone()
+    }
+
+    pub fn cmd_sender(&self) -> Sender<TrayCommand> {
+        self.cmd_sender.clone()
     }
 
     #[inline]
@@ -471,6 +478,16 @@ unsafe extern "system" fn wndproc(
                 if let Some(ctx) = ptr.as_ref() {
                     show_tray_menu(hwnd, ctx.state.clone(), &ctx.cmd_sender, ctx.telemetry.clone());
                 }
+            } else if event == WM_LBUTTONUP {
+                // Nhấp chuột trái: Mở Bảng điều khiển (Dashboard) trực quan!
+                let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut TrayContext;
+                if let Some(ctx) = ptr.as_ref() {
+                    crate::dashboard_window::show_or_focus_dashboard(
+                        ctx.state.clone(),
+                        ctx.cmd_sender.clone(),
+                        ctx.telemetry.clone(),
+                    );
+                }
             } else if event == WM_LBUTTONDBLCLK {
                 // Nhấp đúp chuột trái: chuyển nhanh giữa Active Curve và Full Turbo
                 let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut TrayContext;
@@ -496,6 +513,13 @@ unsafe extern "system" fn wndproc(
             let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut TrayContext;
             if let Some(ctx) = ptr.as_ref() {
                 match cmd_id {
+                    IDM_OPEN_DASHBOARD => {
+                        crate::dashboard_window::show_or_focus_dashboard(
+                            ctx.state.clone(),
+                            ctx.cmd_sender.clone(),
+                            ctx.telemetry.clone(),
+                        );
+                    }
                     IDM_SHOW_TEMP_CHART => {
                         crate::chart_window::show_or_focus_chart_window(ctx.telemetry.clone());
                     }
@@ -562,6 +586,17 @@ unsafe fn show_tray_menu(
         IDM_STATUS,
         PCWSTR(wide_status.as_ptr()),
     );
+
+    let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
+
+    // 1.5. Mở Bảng điều khiển (Dashboard) - In đậm mặc định theo chuẩn Win32 Tray
+    let _ = AppendMenuW(
+        hmenu,
+        MF_STRING,
+        IDM_OPEN_DASHBOARD,
+        w!("Mở Bảng điều khiển (Dashboard)..."),
+    );
+    let _ = SetMenuDefaultItem(hmenu, IDM_OPEN_DASHBOARD as u32, 0);
 
     let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
 
@@ -681,6 +716,9 @@ unsafe fn show_tray_menu(
     let _ = DestroyMenu(hmenu);
 
     match cmd_id.0 as usize {
+        IDM_OPEN_DASHBOARD => {
+            crate::dashboard_window::show_or_focus_dashboard(state, cmd_sender.clone(), telemetry);
+        }
         IDM_SHOW_TEMP_CHART => {
             crate::chart_window::show_or_focus_chart_window(telemetry);
         }

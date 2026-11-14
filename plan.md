@@ -1,284 +1,284 @@
-MASTER IMPLEMENTATION PLAN: MODULE TELEMETRY BUFFER & NATIVE WIN32 GDI CHART (predator-fan-ctl)
+Bản Master Implementation Plan dưới đây định hình toàn bộ kiến trúc kỹ thuật và quy trình thi công chi tiết cho phân hệ Dashboard / Main UI Window của dự án predator-fan-ctl trên nền tảng Rust Win32 GDI thuần.
 
-Kế hoạch thi công dưới đây được thiết kế theo kiến trúc Zero-Allocation Ring Buffer kết hợp Win32 GDI Double-Buffering, bảo toàn tuyệt đối các tính năng hiện hữu của predator-fan-ctl (Smooth EPP Governor, Piecewise Linear Fan Curve, System Tray, Config Hot-Reload) và giữ mức tiêu thụ RAM tăng thêm dưới 64 KB, kích thước thực thi (.exe) không phình to do không sử dụng thêm bất kỳ crate đồ họa bên thứ ba nào.
+1. TỔNG QUAN KIẾN TRÚC & BẢNG MÀU (DESIGN SYSTEM)
 
-1. Kiến trúc Tổng thể & Nguyên tắc Bảo toàn Hệ thống
-Thành phần	Thiết kế kỹ thuật	Mục tiêu hiệu năng / Ràng buộc
-Telemetry Storage	RingBuffer<TelemetrySample, N> cố định kích thước trong bộ nhớ	Chu kỳ lấy mẫu 2 giây 
-→ 
-1800 mẫu/giờ (
-≈28.8 KB RAM). Nếu chu kỳ 1 giây 
-→ 
-3600 mẫu/giờ (
-≈57.6 KB RAM).
-Đồng bộ hóa (Sync)	Arc<RwLock<TelemetryHistory>> hoặc Arc<Mutex<TelemetryHistory>>	Luồng điều khiển quạt (Worker Thread) chỉ giữ lock 
-<50 ns để push mẫu mới, không làm trễ chu kỳ ghi EC/WMI.
-Giao diện Biểu đồ	Native Win32 Window (WS_OVERLAPPEDWINDOW) + GDI Memory DC	Chỉ khởi tạo GDI Objects khi cửa sổ mở; giải phóng hoàn toàn GDI handles khi ẩn/đóng cửa sổ để tránh rò rỉ bộ nhớ (GDI leak).
-Tương tác (UX)	Double-buffered WM_PAINT, WM_TIMER (1000ms), WM_MOUSEMOVE	Vẽ mượt không nhấp nháy (flicker-free), hỗ trợ di chuột xem nhiệt độ chính xác tại từng mốc thời gian (Crosshair & Tooltip).
-2. Phân rã Công việc Chi tiết (Step-by-Step Task Breakdown)
-Giai đoạn 1: Khảo sát & Định vị Điểm Tích hợp (Pre-flight Audit)
+Để đảm bảo mức tiêu thụ RAM dưới 15MB (thực tế mục tiêu giữ quanh mức 3MB - 5MB khi mở cửa sổ) và 0% CPU khi nhàn rỗi, cửa sổ Dashboard sử dụng kiến trúc Event-Driven Off-Screen Double-Buffered Win32 GDI kết hợp với cơ chế GDI Object Cache (khởi tạo Font/Pen/Brush một lần hoặc theo chu kỳ vẽ có kiểm soát, giải phóng chặt chẽ).
 
-Kỹ sư Antigravity thực hiện kiểm tra cấu trúc mã nguồn hiện tại trước khi sửa đổi:
+1.1. Hệ thống Bảng màu (Color Palette & Theme System)
 
-Đọc Cargo.toml và các file trong src/ để xác định crate Win32 đang dùng (windows hay winapi) và danh sách features hiện có.
+Hệ thống hỗ trợ chuyển đổi linh hoạt giữa Predator Dark Theme (mặc định, đồng bộ hoàn toàn với cửa sổ Biểu đồ 1h) và Clean Light Theme thông qua cấu trúc ThemePalette. Lưu ý: Win32 COLORREF sử dụng định dạng 0x00BBGGRR.
 
-Kiểm tra Win32_Graphics_Gdi trong Cargo.toml. Đảm bảo các API GDI cơ bản đã được bật: CreateCompatibleDC, CreateCompatibleBitmap, SelectObject, DeleteObject, DeleteDC, BitBlt, CreatePen, CreateSolidBrush, CreateFontW, Polyline, FillRect, DrawTextW, SetBkMode, SetTextColor.
+Thành phần Giao diện	Mã Hex (Dark Predator)	Macro RGB(R, G, B) (Dark)	Mã Hex (Light Mode)	Vai trò
+Background chính	#121417	RGB(18, 20, 23)	#F4F6F9	Nền tổng thể cửa sổ Dashboard
+Card / Panel Surface	#16191E	RGB(22, 25, 30)	#FFFFFF	Nền Card CPU, GPU và khu vực điều khiển
+Card / Button Border	#343B48	RGB(52, 59, 72)	#D0D7DE	Viền phân tách Card và nút trạng thái bình thường
+Button Normal Surface	#1E2229	RGB(30, 34, 41)	#EAECEF	Nền nút bấm trạng thái nghỉ
+Button Hover Surface	#282E38	RGB(40, 46, 56)	#DCE1E7	Nền nút khi rê chuột (Hover - sáng hơn)
+Button Pressed Surface	#0F1114	RGB(15, 17, 20)	#C8D0D8	Nền nút khi nhấn giữ chuột (Tactile Sink)
+CPU Accent (Cyan)	#00E5FF	RGB(0, 229, 255)	#0097A7	Thanh tiến trình, số liệu nhiệt độ/quạt CPU
+GPU Accent (Orange)	#FF9100	RGB(255, 145, 0)	#E65100	Thanh tiến trình, số liệu nhiệt độ/quạt GPU
+Text Primary	#ECEFF4	RGB(236, 239, 244)	#1F2328	Chữ tiêu đề, thông số chính
+Text Secondary	#8B949E	RGB(139, 148, 158)	#57606A	Nhãn phụ (RPM, Duty %, chú thích)
+Danger / Exit Hover	#FF3B30	RGB(255, 59, 48)	#D32F2F	Viền/Nền cảnh báo cho nút "Thoát" hoặc Quá nhiệt
+1.2. Bố cục Khung hình (Viewport Layout - Kích thước chuẩn 540 x 440 px)
 
-Xác định vị trí vòng lặp đọc nhiệt độ CPU/GPU (Control Loop) và nơi xử lý sự kiện WM_COMMAND của System Tray Menu.
+Cửa sổ sử dụng style WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX (cố định kích thước để tránh vỡ layout GDI và giảm thiểu cấp phát lại Bitmap đệm).
 
-Giai đoạn 2: Xây dựng Module Lưu trữ Lịch sử Nhiệt độ (src/telemetry.rs)
+Header Bar (Y: 0..48): Tiêu đề "PREDATOR FAN CONTROL // DASHBOARD", chỉ báo trạng thái Daemon (ACTIVE), và nút chuyển nhanh Theme (Dark/Light).
 
-Tạo module độc lập quản lý bộ đệm vòng (Rolling Buffer) lưu trữ dữ liệu 1 giờ gần nhất mà không cấp phát động lại bộ nhớ trong quá trình chạy.
+Khu vực Telemetry Cards (Y: 56..200): Chia 2 cột cân xứng:
 
-Định nghĩa cấu trúc mẫu dữ liệu (TelemetrySample):
+CPU Card (X: 16..262, Y: 56..200): Hiển thị Nhiệt độ lớn (32pt Bold), thanh Bar % tốc độ quạt, thông số % quạt và RPM thực tế.
 
-Rust
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
-pub struct TelemetrySample {
-    pub timestamp_secs: u64, // Thời gian tương đối (monotonic) hoặc Unix epoch (giây)
-    pub cpu_temp: u8,        // Nhiệt độ CPU (°C)
-    pub gpu_temp: u8,        // Nhiệt độ GPU (°C)
-    pub cpu_fan_pct: u8,     // % tốc độ quạt CPU (nếu có sẵn trong loop)
-    pub gpu_fan_pct: u8,     // % tốc độ quạt GPU (nếu có sẵn trong loop)
-}
+GPU Card (X: 278..524, Y: 56..200): Hiển thị tương tự với tông màu Cam #FF9100.
 
+Khu vực Chế độ Quạt - Profile Selector (Y: 214..274): 3 nút Segmented Pill nằm ngang (Active Curve, Turbo, Silent). Nút đang kích hoạt sẽ sáng viền Cyan #00E5FF và tô nền nhấn.
 
-(Kích thước mỗi bản ghi: 12–16 bytes).
+Khu vực Tối ưu Nhiệt - CPU EPP Governor (Y: 286..334): Thanh ngang chứa nhãn trạng thái "Khóa nhiệt độ CPU (Smooth EPP Governor)" và nút gạt/bấm Toggle ON/OFF trực quan.
 
-Thiết kế TelemetryHistory (Fixed-Capacity Ring Buffer):
+Khu vực Công cụ & Hành động (Y: 348..424): Lưới 2x2 gồm 4 nút chức năng bo góc:
 
-Định nghĩa hằng số dung lượng dựa trên chu kỳ poll_interval của ứng dụng:
+Chỉnh Fan Curve (Mở file config.toml hoặc trình chỉnh sửa).
 
-Nếu vòng lặp quạt chạy mỗi 1 giây: pub const HISTORY_CAPACITY: usize = 3600;
+Xem Biểu đồ 1h (Gọi chart_window::show_or_focus()).
 
-Nếu vòng lặp quạt chạy mỗi 2 giây: pub const HISTORY_CAPACITY: usize = 1800;
+Tải lại cấu hình (Kích hoạt hot-reload ngay lập tức và nháy thông báo xác nhận).
 
-Khuyến nghị: Chuẩn hóa bước ghi vào buffer là 1 mẫu / 1 giây (3600 mẫu) hoặc kiểm tra khoảng cách thời gian elapsed >= 1s trước khi push, đảm bảo đúng 3600 giây (1 giờ) bất kể tốc độ vòng lặp điều khiển quạt thay đổi khi hot-reload config.
+Thoát ứng dụng (Viền đỏ cảnh báo khi hover, đóng sạch daemon và trả quyền EC về BIOS).
 
-Cấu trúc dữ liệu:
+2. KẾ HOẠCH THI CÔNG CHI TIẾT TỪNG BƯỚC (STEP-BY-STEP TASK BREAKDOWN)
 
-Rust
-pub struct TelemetryHistory {
-    buffer: Box<[TelemetrySample; 3600]>,
-    head: usize,
-    len: usize,
-    start_instant: std::time::Instant,
-}
+Kỹ sư Antigravity thực hiện tuần tự 5 Phase dưới đây.
 
+PHASE 1: Tái cấu trúc Khay hệ thống (System Tray Left-Click Routing)
 
-Các phương thức bắt buộc:
+Mục tiêu: Giữ nguyên Context Menu khi click chuột phải (WM_RBUTTONUP), bổ sung bắt sự kiện click chuột trái (WM_LBUTTONUP) để mở hoặc đưa cửa sổ Dashboard lên tiền cảnh.
 
-pub fn new() -> Self: Khởi tạo mảng cố định trên Heap một lần duy nhất khi bật app.
+Mở file xử lý Tray / Main Loop (ví dụ: src/tray.rs hoặc src/main.rs).
 
-pub fn push(&mut self, cpu_temp: u8, gpu_temp: u8, cpu_fan: u8, gpu_fan: u8): Ghi đè vào vị trí head, cập nhật head = (head + 1) % 3600, tăng len tối đa đến 3600.
-
-pub fn iter_chronological(&self) -> impl Iterator<Item &TelemetrySample>: Trả về chuỗi dữ liệu theo đúng thứ tự thời gian từ cũ nhất đến mới nhất (tách 2 slice từ head..len và 0..head khi bộ đệm đã đầy).
-
-pub fn stats(&self) -> Option<(u8, u8, f32, u8, u8, f32)>: Tính nhanh Min / Max / Avg của CPU và GPU trong 1 giờ qua để hiển thị trên Header của biểu đồ.
-
-Giai đoạn 3: Tích hợp Thu thập Dữ liệu vào Luồng Điều khiển (Control Loop)
-
-Tuyệt đối không làm thay đổi thuật toán Smooth EPP Governor hay Piecewise Linear Fan Curve hiện tại:
-
-Khởi tạo let telemetry = Arc::new(Mutex::new(TelemetryHistory::new())); tại hàm main.
-
-Truyền một bản Arc::clone(&telemetry) vào luồng điều khiển quạt (Worker Thread) và một bản vào luồng giao diện (UI / Tray Thread).
-
-Ngay sau bước đọc nhiệt độ CPU/GPU và tính toán tốc độ quạt trong vòng lặp hiện hữu, chèn lệnh ghi không chặn (non-blocking / micro-lock):
+Cập nhật hằng số thông điệp Callback của Tray Icon (WM_TRAYICON):
+Trong hàm wndproc của cửa sổ ẩn quản lý Tray:
 
 Rust
-if last_telemetry_record.elapsed() >= Duration::from_secs(1) {
-    if let Ok(mut hist) = telemetry.try_lock() {
-        hist.push(cpu_temp, gpu_temp, cpu_fan_pct, gpu_fan_pct);
-        last_telemetry_record = Instant::now();
+WM_TRAYICON => {
+    let event = (lparam.0 & 0xFFFF) as u32;
+    match event {
+        WM_LBUTTONUP => {
+            // Mở hoặc Focus cửa sổ Dashboard chính
+            crate::dashboard_window::show_or_focus_dashboard();
+        }
+        WM_RBUTTONUP | WM_CONTEXTMENU => {
+            // Giữ nguyên logic hiển thị Popup Menu chuột phải hiện tại
+            show_tray_context_menu(hwnd);
+        }
+        _ => {}
     }
+    LRESULT(0)
 }
 
 
-Lưu ý: Sử dụng try_lock() hoặc giữ lock() chỉ trong thao tác gán mảng để đảm bảo luồng điều khiển phần cứng không bao giờ bị chặn bởi luồng vẽ UI.
+Bổ sung mục Menu dự phòng: Thêm dòng "Mở Bảng điều khiển (Dashboard)" ở vị trí đầu tiên (in đậm bằng SetMenuDefaultItem) trong menu chuột phải để người dùng có 2 cách truy cập đồng nhất.
 
-Giai đoạn 4: Xây dựng Cửa sổ Biểu đồ Native Win32 GDI (src/chart_window.rs)
+PHASE 2: Xây dựng Hệ thống Nút bấm Phản hồi Xúc giác (Tactile UI Engine)
 
-Thiết kế cửa sổ vẽ đồ thị hoàn toàn bằng Win32 GDI thuần, giao diện tối (Dark Mode) đồng bộ với phong cách Predator.
+Mục tiêu: Tạo trải nghiệm nút bấm bo góc (RoundRect), sáng lên khi rê chuột (Hover), và có độ lún vật lý (Pressed - dịch chuyển nội dung/khung 1-2px xuống dưới) mà không tốn CPU.
 
-4.1. Quản lý Vòng đời Cửa sổ (Window Lifecycle)
+Khởi tạo module src/dashboard_window.rs.
 
-Đăng ký Window Class PredatorTempChartWndClass với cờ CS_HREDRAW | CS_VREDRAW | CS_OWNDC.
+Định nghĩa cấu trúc Nút và Trạng thái Tương tác:
 
-Khi người dùng mở biểu đồ từ System Tray:
+Rust
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ButtonId {
+    ProfileCurve,
+    ProfileTurbo,
+    ProfileSilent,
+    ToggleEpp,
+    OpenCurveEditor,
+    OpenTelemetryChart,
+    ReloadConfig,
+    ExitApp,
+    ToggleTheme,
+}
 
-Nếu cửa sổ chưa tồn tại hoặc đang ẩn: Hiển thị cửa sổ (ShowWindow(hwnd, SW_SHOW)), đưa lên tiền cảnh (SetForegroundWindow(hwnd)), và bật bộ đếm thời gian SetTimer(hwnd, TIMER_ID_REFRESH, 1000, None) để tự động làm mới mỗi 1 giây.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum UiState {
+    Normal,
+    Hovered,
+    Pressed,
+}
 
-Khi người dùng bấm nút Close (X) trên cửa sổ biểu đồ: Bắt sự kiện WM_CLOSE, hủy Timer (KillTimer), ẩn cửa sổ (ShowWindow(hwnd, SW_HIDE)) và trả về LRESULT(0) (tuyệt đối không gọi PostQuitMessage để tránh làm tắt toàn bộ ứng dụng System Tray chạy ngầm).
+pub struct TactileButton {
+    pub id: ButtonId,
+    pub rect: RECT,
+    pub label: &'static str,
+    pub state: UiState,
+    pub is_active: bool, // Dùng cho Profile đang chọn hoặc Toggle EPP đang bật
+    pub is_danger: bool, // Dùng cho nút Thoát
+}
 
-4.2. Kỹ thuật Vẽ Double-Buffering (WM_PAINT)
 
-Để tránh hiện tượng nhấp nháy khi cập nhật mỗi giây hoặc khi kéo giãn cửa sổ (WM_SIZE):
+Thuật toán Vẽ Nút Tactile (draw_tactile_button):
 
-Bắt WM_ERASEBKGND và trả về LRESULT(1) để ngăn Windows tự xóa nền trắng.
+Hiệu ứng độ nảy (Tactile Bounce/Sink):
+
+Khi state == UiState::Hovered: Giữ nguyên rect hoặc nâng nhẹ biên trên -1px, đổi màu nền sang Button Hover Surface, đổi màu viền sang CPU Accent (#00E5FF) (hoặc #FF3B30 nếu is_danger == true).
+
+Khi state == UiState::Pressed: Dịch chuyển khung vẽ và tọa độ chữ xuống dưới và sang phải +2px (rect.top += 2; rect.bottom += 2; rect.left += 1; rect.right += 1;), tạo cảm giác phím cơ lún xuống khi bấm chuột.
+
+Khi is_active == true (ví dụ Profile đang được chọn hoặc EPP đang bật): Tô nền pha màu Cyan đậm RGB(0, 65, 80) và viền Cyan sáng RGB(0, 229, 255) dày 2px.
+
+Dùng hàm Win32 RoundRect(hdc, left, top, right, bottom, 10, 10) để tạo góc bo mượt 10px.
+
+Cơ chế TrackMouseEvent chống kẹt trạng thái Hover:
+
+Khi xử lý WM_MOUSEMOVE: Kiểm tra tọa độ (x, y) bằng PtInRect.Chỉ gọi InvalidateRect(hwnd, None, FALSE) khi và chỉ khi hovered_button thay đổi so với frame trước (đảm bảo rê chuột trong cùng 1 vùng không vẽ lại liên tục, giữ CPU ~0%).
+
+Đăng ký TrackMouseEvent với cờ TME_LEAVE. Khi nhận WM_MOUSELEAVE, đặt toàn bộ trạng thái nút về Normal và vẽ lại 1 lần duy nhất.
+
+PHASE 3: Thiết kế Luồng Dữ liệu Thời gian thực (Zero-Contention State Snapshot)
+
+Mục tiêu: Đọc dữ liệu từ vòng lặp điều khiển quạt sang giao diện Dashboard mà không gây khóa (lock contention) làm trễ chu kỳ ghi thanh ghi EC.
+
+Cấu trúc DashboardSnapshot:
+Bổ sung hoặc mở rộng cấu trúc trạng thái chia sẻ (nằm trong Arc<Mutex<SharedAppState>> hoặc sử dụng AtomicU32 đóng gói):
+
+Rust
+#[derive(Clone, Copy, Default)]
+pub struct DashboardSnapshot {
+    pub cpu_temp_c: u32,
+    pub cpu_fan_pct: u32,
+    pub cpu_fan_rpm: u32,
+    pub gpu_temp_c: u32,
+    pub gpu_fan_pct: u32,
+    pub gpu_fan_rpm: u32,
+    pub active_profile: FanProfileMode, // Curve, Turbo, Silent
+    pub epp_locked: bool,
+    pub reload_flash_ticks: u8, // Đếm ngược hiệu ứng báo "Đã tải lại cấu hình!"
+}
+
+
+Cách tính RPM (nếu WMI/EC trả về RPM hoặc nội suy):
+
+Nếu phần cứng trả trực tiếp thanh ghi RPM từ EC: đọc thẳng giá trị thực.
+
+Nếu phần cứng trên model hiện tại chỉ trả về % quạt: đọc từ thanh ghi tach hoặc nội suy chuẩn xác theo dải tốc độ tối đa của quạt Predator (tối đa ~5000 - 5600 RPM ở 100%) kèm ký hiệu rõ ràng.
+
+PHASE 4: Kỹ thuật Vẽ GDI Double-Buffering & Quản lý Vòng đời Cửa sổ (Singleton)
+
+Mục tiêu: Chống nhấp nháy (zero-flicker) tuyệt đối, đóng [X] chỉ ẩn cửa sổ và ngắt bộ đếm thời gian để CPU về 0%.
+
+Quản lý Singleton Window Handle:
+
+Lưu DASHBOARD_HWND: AtomicIsize = AtomicIsize::new(0).
+
+Trong hàm show_or_focus_dashboard():
+
+Nếu DASHBOARD_HWND != 0: Gọi ShowWindow(hwnd, SW_RESTORE), SetForegroundWindow(hwnd), khởi động lại Timer cập nhật giao diện SetTimer(hwnd, IDT_DASHBOARD_REFRESH, 1000, None), và gọi InvalidateRect để vẽ ngay lập tức.
+
+Nếu DASHBOARD_HWND == 0: Đăng ký WNDCLASSEXW với hbrBackground = None (chống chớp trắng), tạo cửa sổ và lưu HWND.
+
+Tối ưu CPU 0% khi Cửa sổ Ẩn hoặc Minimize:
+
+Bắt sự kiện đóng cửa sổ (WM_CLOSE):TUYỆT ĐỐI KHÔNG gọi DestroyWindow hay PostQuitMessage. Thay vào đó:
+
+Rust
+WM_CLOSE => {
+    unsafe {
+        let _ = KillTimer(hwnd, IDT_DASHBOARD_REFRESH);
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+    LRESULT(0)
+}
+
+
+Bắt sự kiện thu nhỏ (WM_SIZE):
+Nếu wparam.0 as u32 == SIZE_MINIMIZED, gọi KillTimer(hwnd, IDT_DASHBOARD_REFRESH). Khi SIZE_RESTORED, bật lại SetTimer chu kỳ 1000ms (1 giây/lần). Nhờ đó, khi không nhìn vào bảng điều khiển, tiến trình giao diện tốn 0.00% CPU.
+
+Quy trình Vẽ WM_PAINT với Double-Buffering chuẩn:
+
+Bắt WM_ERASEBKGND -> Trả về LRESULT(1) ngay lập tức.
 
 Trong WM_PAINT:
 
-Gọi BeginPaint(hwnd, &mut ps) lấy hdc_screen.
+BeginPaint(hwnd, &mut ps)
 
-Tạo Memory DC (CreateCompatibleDC(hdc_screen)) và Bitmap tương thích (CreateCompatibleBitmap(hdc_screen, width, height)).
+Tạo mem_dc = CreateCompatibleDC(hdc) và mem_bmp = CreateCompatibleBitmap(hdc, width, height).
 
-Mọi thao tác vẽ thực hiện trên hdc_mem, sau đó chép toàn bộ ra màn hình bằng 1 lệnh BitBlt(..., SRCCOPY) duy nhất, rồi dọn dẹp (DeleteObject, DeleteDC, EndPaint).
+Chọn old_bmp = SelectObject(mem_dc, mem_bmp).
 
-4.3. Bố cục Đồ họa & Bảng màu (Predator Dark Theme)
+SetBkMode(mem_dc, TRANSPARENT).
 
-Màu nền tổng thể: #121417 (RGB(18, 20, 23)).
+Vẽ nền & Header: Tô nền #121417, vẽ đường kẻ phân tách #343B48.
 
-Vùng vẽ đồ thị (Plot Area): Chừa lề Trái 50px (trục nhiệt độ °C), Dưới 35px (trục thời gian), Trên 55px (thanh tiêu đề & thông số tổng hợp), Phải 25px.
+Vẽ Card CPU (#00E5FF) & Card GPU (#FF9100):
 
-Lưới tọa độ (Gridlines):
+Dùng RoundRect vẽ khung Card nền #16191E, viền #343B48.
 
-Trục Y (Nhiệt độ): Cố định dải từ 30°C đến 100°C (bước chia mỗi 10°C: 30, 40, 50, 60, 70, 80, 90, 100). Vẽ đường ngang nét mảnh màu #282C34 (RGB(40, 44, 52)). Đường ngưỡng cảnh báo 85°C vẽ nét đứt màu đỏ sẫm #6E2626.
+Vẽ nhãn "CPU TELEMETRY" / "GPU TELEMETRY".
 
-Trục X (Thời gian): Chia mốc mỗi 10 phút (-60m, -50m, -40m, -30m, -20m, -10m, Now).
+Vẽ số nhiệt độ cỡ lớn (CreateFontW cao -36, FW_BOLD, "Segoe UI"): Ví dụ "64°C".
 
-Đường biểu diễn nhiệt độ (Data Series - Dùng Polyline):
+Vẽ thanh Progress Bar ngang biểu diễn % quạt: Khung nền tối #0F1114, phần trăm thực tế tô bằng Brush màu Cyan (#00E5FF) cho CPU và Orange (#FF9100) cho GPU.
 
-CPU Temperature: Đường màu Cyan sáng #00E5FF (RGB(0, 229, 255)), độ dày 2px.
+Vẽ dòng thông số dưới cùng của Card: "Tốc độ quạt: 55%  |  3100 RPM".
 
-GPU Temperature: Đường màu Cam/Đỏ Predator #FF5252 hoặc #FF9100 (RGB(255, 145, 0)), độ dày 2px.
+Vẽ Hàng Nút Chọn Profile & Toggle EPP: Duyệt mảng TactileButton và gọi hàm draw_tactile_button.
 
-Công thức ánh xạ tọa độ điểm thứ 
-𝑖
-i:
+Vẽ Lưới 4 Nút Chức năng Cuối: Hiển thị rõ trạng thái hover/click.
 
-Tọa độ ngang 
-𝑋
-X: Ánh xạ theo khoảng cách thời gian thực tế so với hiện tại hoặc theo chỉ số mẫu trong cửa sổ 3600 mẫu:
+Blit ra màn hình: BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY).
 
-𝑋
-=
-plot_left
-+
-(
-sample_index
-3599.0
-)
-×
-plot_width
-X=plot_left+(
-3599.0
-sample_index
-	​
+Dọn dẹp GDI (Chống rò rỉ RAM tuyệt đối): Khôi phục SelectObject(mem_dc, old_bmp), gọi DeleteObject(mem_bmp), DeleteDC(mem_dc) và EndPaint(hwnd, &ps). Mọi HBRUSH, HPEN, HFONT tạo tạm trong hàm vẽ đều phải được DeleteObject trước khi thoát hàm (hoặc lưu tĩnh trong struct GdiResources khởi tạo 1 lần).
 
-)×plot_width
+PHASE 5: Liên kết Hành động Nút bấm (Action Dispatchers)
 
-(Lưu ý: Nếu mới khởi động ứng dụng chưa đủ 1 giờ, có thể chọn căn phải về phía mốc Now hoặc giãn theo số mẫu hiện có, khuyến nghị căn phải về mốc Now để trục thời gian -60m .. Now luôn phản ánh đúng tỉ lệ thực tế, hoặc tự động co giãn trục X khi dữ liệu dưới 5 phút đầu).
+Khi người dùng nhấn (WM_LBUTTONDOWN) và nhả chuột (WM_LBUTTONUP) trên cùng một ButtonId, thực thi lệnh tương ứng:
 
-Tọa độ dọc 
-𝑌
-Y:
+ButtonId	Hành động Thực thi (Action Handler)
+ProfileCurve	Chuyển chế độ sang Active Curve (điều khiển tự động theo đồ thị nhiệt), ghi nhận vào State và kích hoạt chu kỳ tính toán quạt ngay lập tức.
+ProfileTurbo	Chuyển chế độ sang Turbo (ép quạt 100% hoặc kích hoạt thanh ghi Turbo WMI/EC), cập nhật viền sáng sang nút Turbo.
+ProfileSilent	Chuyển chế độ sang Silent (giới hạn trần quạt êm ái theo ngưỡng an toàn), cập nhật giao diện.
+ToggleEpp	Đảo trạng thái khóa xung/nhiệt độ Smooth EPP Governor (Bật <-> Tắt), áp dụng ngay chính sách nguồn điện CPU và đổi nhãn nút giữa [ ĐANG BẬT ] (màu Cyan) và [ ĐANG TẮT ] (màu Xám).
+OpenCurveEditor	Mở file cấu hình config.toml bằng trình soạn thảo mặc định của hệ thống (ShellExecuteW với lệnh "open") hoặc mở hộp thoại chỉnh nhanh, giúp người dùng sửa điểm uốn đồ thị quạt tức thì.
+OpenTelemetryChart	Gọi trực tiếp hàm mở cửa sổ Biểu đồ nhiệt độ 1h (chart_window::show_chart_window()).
+ReloadConfig	Gọi hàm đọc lại config.toml ngay lập tức, cập nhật Fan Curve & EPP, đặt reload_flash_ticks = 3 để hiển thị dòng chữ xanh "✓ Đã tải lại cấu hình thành công!" trên Header trong 3 giây.
+ExitApp	Ẩn cửa sổ, tháo Tray Icon, khôi phục quạt về chế độ Auto của BIOS để bảo vệ phần cứng, và gọi PostQuitMessage(0) kết thúc toàn bộ ứng dụng.
+ToggleTheme	Chuyển đổi qua lại giữa Predator Dark (#121417) và Light Mode, gọi InvalidateRect để đổi giao diện tức thời.
+3. TIÊU CHUẨN NGHIỆM THU & KIỂM THỬ (QA & VERIFICATION CHECKLIST CHO ANTIGRAVITY)
 
-𝑌
-=
-plot_bottom
-−
-(
-clamp
-(
-𝑇
-,
-30
-,
-100
-)
-−
-30
-70.0
-)
-×
-plot_height
-Y=plot_bottom−(
-70.0
-clamp(T,30,100)−30
-	​
-
-)×plot_height
-
-Thanh thông tin phía trên (Header Bar):
-
-Hiển thị trực quan bằng font Segoe UI Semibold (10pt):
-
-[■ CPU] Current: XX°C | Min: XX°C | Max: XX°C | Avg: XX.X°C
-
-[■ GPU] Current: XX°C | Min: XX°C | Max: XX°C | Avg: XX.X°C
-
-Tương tác Chuột (Interactive Crosshair & Tooltip):
-
-Bắt sự kiện WM_MOUSEMOVE và WM_MOUSELEAVE.
-
-Khi con trỏ chuột nằm trong vùng Plot Area, xác định mẫu dữ liệu gần nhất theo trục 
-𝑋
-X, vẽ một đường gióng dọc (Crosshair) và hộp Tooltip nhỏ hiển thị: Thời gian cách hiện tại (-XXm XXs) | CPU: XX°C | GPU: XX°C.
-
-Giai đoạn 5: Tích hợp vào System Tray Menu & Hot-Reload Safe
-
-Định nghĩa ID Menu mới:
-
-Thêm hằng số IDM_SHOW_TEMP_CHART (ví dụ 1050, đảm bảo không trùng với các ID menu chuyển đổi chế độ quạt, EPP hay Reload Config hiện tại).
-
-Cập nhật hàm tạo Context Menu của System Tray:
-
-Chèn mục "Temperature History (1h Chart)..." vào vị trí hợp lý trên menu chuột phải (ngay phía trên mục Reload Config / Exit).
-
-Tùy chọn nâng cao: Hỗ trợ mở nhanh biểu đồ khi người dùng Double-Click chuột trái (WM_LBUTTONDBLCLK) vào biểu tượng System Tray (nếu sự kiện này hiện chưa gán cho tính năng khác).
-
-Xử lý sự kiện WM_COMMAND:
-
-Khi nhận LOWORD(wparam) == IDM_SHOW_TEMP_CHART, gọi hàm chart_window::show_or_focus_chart_window().
-
-Dọn dẹp khi Thoát ứng dụng (IDM_EXIT / WM_DESTROY):
-
-Khi người dùng chọn thoát hoàn toàn ứng dụng từ Tray Menu, đảm bảo hủy cả cửa sổ biểu đồ (DestroyWindow) trước khi kết thúc message loop.
-
-3. Kế hoạch Kiểm thử & Nghiệm thu (Verification & QA Checklist cho Antigravity)
-
-Kỹ sư Antigravity phải thực hiện đầy đủ các bước kiểm thử sau và ghi kết quả vào báo cáo Markdown:
+Sau khi viết code xong, Antigravity cần chạy bộ kiểm thử sau và ghi kết quả vào báo cáo Markdown:
 
 1
 Kiểm tra Biên dịch & Kích thước Binary
-Đảm bảo không phát sinh cảnh báo hoặc phình dung lượng
+Cargo Release Build
 
-Chạy cargo check và cargo build --release. Xác nhận quá trình biên dịch đạt 0 errors, 0 warnings. Kiểm tra dung lượng file thực thi .exe trong target/release/ vẫn giữ dưới ngưỡng quy định (nhỏ hơn 3 MB).
+Chạy cargo build --release. Đảm bảo trình biên dịch hoàn tất với 0 errors, 0 warnings và kích thước file .exe giữ nguyên dưới ngưỡng 3 MB.
 
 2
-Kiểm tra Tính toàn vẹn của Các tính năng Hiện hữu
-Zero-Regression Test
+Kiểm tra Tương tác Khay hệ thống & Singleton
+Tray Left/Right Click
 
-Xác nhận Smooth EPP Governor, nội suy đường cong quạt (Piecewise Linear Fan Curve), tự động tải lại cấu hình (Config Hot-Reload), và các mục menu System Tray cũ hoạt động chính xác 100% như trước khi nâng cấp.
+Click chuột trái vào icon dưới System Tray -> Cửa sổ Dashboard phải bật lên ngay giữa màn hình. Click chuột trái lần nữa hoặc khi cửa sổ đang bị che khuất -> Cửa sổ phải tự động nhảy lên trên cùng (SetForegroundWindow) mà không tạo ra cửa sổ thứ hai. Click chuột phải -> Menu truyền thống vẫn hoạt động bình thường.
 
 3
-Kiểm tra Vòng đời Cửa sổ & Rò rỉ GDI (GDI Leak Test)
-Quan trọng đối với phần mềm chạy ngầm
+Kiểm tra Phản hồi Xúc giác (Tactile Feedback)
+Hover, Press & Release
 
-Mở cửa sổ biểu đồ từ System Tray, thay đổi kích thước cửa sổ (Resize/Maximize), đóng cửa sổ bằng nút X và mở lại liên tục 10 lần. Mở Task Manager (bật cột GDI Objects và Memory):
-
-Xác nhận khi đóng cửa sổ biểu đồ, ứng dụng không bị tắt mà vẫn chạy dưới System Tray.
-
-Xác nhận số lượng GDI Objects không tăng tịnh tiến sau mỗi chu kỳ vẽ WM_PAINT hoặc sau mỗi lần đóng/mở cửa sổ.
-
-Xác nhận mức sử dụng RAM tổng thể nằm dưới ngưỡng 2.5 MB.
+Rê chuột qua từng nút (Active Curve, Turbo, Silent, EPP Toggle, 4 nút công cụ) -> Nút phải sáng nền lên mượt mà, không nhấp nháy. Nhấn giữ chuột trái -> Nút phải lún xuống 2px. Kéo chuột ra ngoài rồi thả -> Không kích hoạt nhầm lệnh.
 
 4
-Kiểm tra Logic Bộ đệm Vòng (Ring Buffer Unit Test)
-Xác minh giới hạn 1 giờ (3600 mẫu)
+Kiểm tra Hiệu năng & Chống rò rỉ GDI Objects
+RAM dưới 15MB, CPU 0%
 
-Viết và chạy unit test (cargo test) cho TelemetryHistory: nạp thử 5000 mẫu giả lập liên tiếp để xác nhận bộ đệm tự động ghi đè các mẫu cũ hơn 3600 giây, không panic, và iterator trả về đúng 3600 mẫu theo thứ tự thời gian tăng dần.
+Mở Task Manager (Details tab), bật cột GDI Objects, Memory (Active Private Working Set) và CPU:
 
-4. Yêu cầu Báo cáo Tiến trình dành cho Antigravity
+Rê chuột liên tục khắp cửa sổ trong 30 giây -> Số lượng GDI Objects phải giữ nguyên cố định (tuyệt đối không tăng dần theo thời gian).
 
-Sau khi hoàn tất thi công và kiểm thử theo kế hoạch trên, Antigravity cần xuất báo cáo tiến trình qua file Markdown gửi lại cho Kiến trúc sư trưởng 4 Argon bao gồm:
+Bộ nhớ RAM tiêu thụ tổng cộng phải nhỏ hơn 15 MB (kỳ vọng đạt 2.5 MB - 5 MB).
 
-Danh sách các file đã tạo mới và các file đã chỉnh sửa (kèm tóm tắt thay đổi).
+Nhấn nút [X] đóng cửa sổ Dashboard -> Cửa sổ ẩn xuống Tray, mức sử dụng CPU lập tức rơi về 0.00%.
 
-Kết quả chạy cargo test cho module TelemetryHistory.
+4. YÊU CẦU BÁO CÁO TIẾN ĐỘ TỪ ANTIGRAVITY
 
-Thông số đo đạc thực tế sau khi build --release: Kích thước file .exe, mức tiêu thụ RAM và số lượng GDI Objects khi ẩn/hiện cửa sổ biểu đồ.
-
-Các vấn đề phát sinh (nếu có) trong quá trình đồng bộ luồng giữa Worker Thread và Win32 UI Message Loop để nhận chỉ đạo tiếp theo.
+Sau khi hoàn thành thi công theo kế hoạch trên, Antigravity hãy tổng hợp báo cáo tiến trình (bao gồm danh sách file đã sửa đổi/tạo mới, kết quả biên dịch cargo build --release, và thông số đo đạc RAM/GDI Objects thực tế) để 4 Argon nghiệm thu hoặc tinh chỉnh sâu hơn nếu cần.
