@@ -173,6 +173,12 @@ impl Drop for SingleInstanceGuard {
 }
 
 fn main() {
+    // 0. Kích hoạt Per-Monitor DPI Awareness v2 để chống mờ nhòe font chữ trên Windows
+    unsafe {
+        use windows::Win32::UI::HiDpi::*;
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+
     // 1. Tự động kết nối tới Console của tiến trình cha (nếu được khởi chạy từ PowerShell/CMD)
     unsafe {
         let _ = AttachConsole(ATTACH_PARENT_PROCESS);

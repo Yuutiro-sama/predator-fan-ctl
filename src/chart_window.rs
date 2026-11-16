@@ -77,39 +77,119 @@ const COLOR_BG: COLORREF = rgb(18, 20, 23);           // #121417
 const COLOR_PLOT_BG: COLORREF = rgb(22, 25, 30);      // #16191E
 const COLOR_BORDER: COLORREF = rgb(52, 59, 72);       // #343B48
 const COLOR_GRID: COLORREF = rgb(40, 44, 52);         // #282C34
-const COLOR_WARN_85: COLORREF = rgb(229, 57, 53);     // #E53935
-const COLOR_CPU: COLORREF = rgb(0, 229, 255);         // #00E5FF (Cyan)
-const COLOR_GPU: COLORREF = rgb(255, 145, 0);         // #FF9100 (Orange)
-const COLOR_TEXT_MUTED: COLORREF = rgb(136, 146, 176); // #8892B0
-const COLOR_TEXT_LIGHT: COLORREF = rgb(230, 237, 243); // #E6EDF3
-const COLOR_CROSSHAIR: COLORREF = rgb(92, 99, 112);   // #5C6370
+const COLOR_WARN_85: COLORREF = rgb(255, 69, 58);     // #FF453A (Đỏ cảnh báo rực rỡ)
+const COLOR_CPU: COLORREF = rgb(0, 229, 255);         // #00E5FF (Cyan sáng rực)
+const COLOR_GPU: COLORREF = rgb(255, 145, 0);         // #FF9100 (Orange sáng rực)
+const COLOR_TEXT_MUTED: COLORREF = rgb(176, 190, 208); // #B0BED0 (Chữ phụ tương phản cao)
+const COLOR_TEXT_LIGHT: COLORREF = rgb(240, 244, 248); // #F0F4F8 (Trắng sáng nét căng)
+const COLOR_CROSSHAIR: COLORREF = rgb(120, 130, 150); // #788296
 const COLOR_TOOLTIP_BG: COLORREF = rgb(26, 29, 36);   // #1A1D24
 const COLOR_TOOLTIP_BORDER: COLORREF = rgb(70, 78, 92); // #464E5C
 
 // Bảng màu cho thanh Tab
-const COLOR_TAB_BG_ACTIVE: COLORREF = rgb(34, 40, 49);     // #222831
+const COLOR_TAB_BG_ACTIVE: COLORREF = rgb(38, 45, 56);     // #262D38
 const COLOR_TAB_BG_INACTIVE: COLORREF = rgb(22, 25, 30);   // #16191E
-const COLOR_TAB_BORDER: COLORREF = rgb(52, 59, 72);        // #343B48
-const COLOR_TAB_INDICATOR: COLORREF = rgb(0, 229, 255);     // #00E5FF
+const COLOR_TAB_BORDER: COLORREF = rgb(65, 74, 90);        // #414A5A
+const COLOR_TAB_INDICATOR: COLORREF = rgb(0, 229, 255);    // #00E5FF
 
-/// Vị trí tọa độ của từng nút Tab (Hit-Testing)
-pub fn get_tab_rect(mode: ChartMode) -> RECT {
+/// Helper tỉ lệ tọa độ theo DPI (MulDiv(val, dpi, 96))
+#[inline]
+pub fn scale_dpi(val: i32, dpi: u32) -> i32 {
+    (val * dpi as i32 + 48) / 96
+}
+
+/// Tính toán chiều cao Font theo Point Size chuẩn Em-Height (-MulDiv(point_size, dpi, 72))
+#[inline]
+pub fn font_height_for_pt(pt: f32, dpi: u32) -> i32 {
+    let h = (pt * (dpi as f32) / 72.0).round() as i32;
+    -h.max(1)
+}
+
+/// Truy vấn DPI của cửa sổ Win32 (GetDpiForWindow, fallback 96 nếu không khả dụng)
+pub unsafe fn get_window_dpi(hwnd: HWND) -> u32 {
+    type GetDpiForWindowFn = unsafe extern "system" fn(HWND) -> u32;
+    if let Ok(user32) = windows::Win32::System::LibraryLoader::GetModuleHandleW(w!("user32.dll")) {
+        if let Some(func) = windows::Win32::System::LibraryLoader::GetProcAddress(
+            user32,
+            windows::core::s!("GetDpiForWindow"),
+        ) {
+            let func: GetDpiForWindowFn = std::mem::transmute(func);
+            let dpi = func(hwnd);
+            if dpi > 0 {
+                return dpi;
+            }
+        }
+    }
+    96
+}
+
+/// Vị trí tọa độ của từng nút Tab thích ứng với DPI (Hit-Testing & Vẽ)
+pub fn get_tab_rect_dpi(mode: ChartMode, dpi: u32) -> RECT {
+    if dpi == 96 {
+        return match mode {
+            ChartMode::TempAndFan => RECT { left: 20, top: 8, right: 180, bottom: 34 },
+            ChartMode::Power => RECT { left: 186, top: 8, right: 326, bottom: 34 },
+            ChartMode::Clock => RECT { left: 332, top: 8, right: 482, bottom: 34 },
+        };
+    }
+    let top = scale_dpi(8, dpi);
+    let tab_h = scale_dpi(36, dpi);
+    let bottom = top + tab_h;
+
+    let left_base = scale_dpi(20, dpi);
+    let gap = scale_dpi(6, dpi);
+
+    let w0 = scale_dpi(175, dpi);
+    let w1 = scale_dpi(155, dpi);
+    let w2 = scale_dpi(165, dpi);
+
     match mode {
-        ChartMode::TempAndFan => RECT { left: 20, top: 8, right: 180, bottom: 34 },
-        ChartMode::Power => RECT { left: 186, top: 8, right: 326, bottom: 34 },
-        ChartMode::Clock => RECT { left: 332, top: 8, right: 482, bottom: 34 },
+        ChartMode::TempAndFan => RECT {
+            left: left_base,
+            top,
+            right: left_base + w0,
+            bottom,
+        },
+        ChartMode::Power => {
+            let left = left_base + w0 + gap;
+            RECT {
+                left,
+                top,
+                right: left + w1,
+                bottom,
+            }
+        }
+        ChartMode::Clock => {
+            let left = left_base + w0 + gap + w1 + gap;
+            RECT {
+                left,
+                top,
+                right: left + w2,
+                bottom,
+            }
+        }
     }
 }
 
-/// Hit-testing tìm tab khi người dùng click chuột
-pub fn hit_test_tab(x: i32, y: i32) -> Option<ChartMode> {
+/// Vị trí tọa độ của từng nút Tab (tiêu chuẩn 96 DPI - Tương thích ngược Unit Tests)
+pub fn get_tab_rect(mode: ChartMode) -> RECT {
+    get_tab_rect_dpi(mode, 96)
+}
+
+/// Hit-testing tìm tab khi người dùng click chuột thích ứng DPI
+pub fn hit_test_tab_dpi(x: i32, y: i32, dpi: u32) -> Option<ChartMode> {
     for &mode in &[ChartMode::TempAndFan, ChartMode::Power, ChartMode::Clock] {
-        let r = get_tab_rect(mode);
+        let r = get_tab_rect_dpi(mode, dpi);
         if x >= r.left && x <= r.right && y >= r.top && y <= r.bottom {
             return Some(mode);
         }
     }
     None
+}
+
+/// Hit-testing tìm tab khi người dùng click chuột (tiêu chuẩn 96 DPI - Tương thích ngược)
+pub fn hit_test_tab(x: i32, y: i32) -> Option<ChartMode> {
+    hit_test_tab_dpi(x, y, 96)
 }
 
 /// Trạng thái dữ liệu nội bộ gắn với HWND
@@ -167,9 +247,14 @@ fn run_chart_window(telemetry: Arc<Mutex<TelemetryHistory>>) -> Result<()> {
 
         let _ = RegisterClassW(&wnd_class);
 
-        // Kích thước mặc định 840 x 540, căn giữa màn hình
-        let width = 840;
-        let height = 540;
+        // Kích thước mặc định co giãn theo DPI (860 x 560 ở 96 DPI, tự co giãn ở 120 DPI)
+        let hdc_screen = GetDC(HWND::default());
+        let initial_dpi = GetDeviceCaps(hdc_screen, LOGPIXELSX) as u32;
+        let _ = ReleaseDC(HWND::default(), hdc_screen);
+        let initial_dpi = if initial_dpi > 0 { initial_dpi } else { 96 };
+
+        let width = scale_dpi(860, initial_dpi);
+        let height = scale_dpi(560, initial_dpi);
         let screen_w = GetSystemMetrics(SM_CXSCREEN);
         let screen_h = GetSystemMetrics(SM_CYSCREEN);
         let pos_x = (screen_w - width) / 2;
@@ -218,7 +303,29 @@ fn run_chart_window(telemetry: Arc<Mutex<TelemetryHistory>>) -> Result<()> {
     }
 }
 
-/// Helper tạo HFONT Segoe UI
+/// Helper tạo HFONT Segoe UI DPI-Aware chuẩn Em-Height (-MulDiv(point_size, dpi, 72))
+unsafe fn create_chart_dpi_font(dpi: u32, point_size: f32, weight: i32) -> HFONT {
+    let height = font_height_for_pt(point_size, dpi);
+    CreateFontW(
+        height,
+        0,
+        0,
+        0,
+        weight,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET.0 as u32,
+        OUT_DEFAULT_PRECIS.0 as u32,
+        CLIP_DEFAULT_PRECIS.0 as u32,
+        CLEARTYPE_QUALITY.0 as u32,
+        VARIABLE_PITCH.0 as u32,
+        w!("Segoe UI"),
+    )
+}
+
+/// Helper tạo HFONT Segoe UI (96 DPI tương thích)
+#[allow(dead_code)]
 unsafe fn create_chart_font(height: i32, weight: i32) -> HFONT {
     CreateFontW(
         height,
@@ -307,8 +414,8 @@ pub fn map_clock_y(clock_ghz: f32, plot_top: i32, plot_bottom: i32) -> i32 {
 // HÀM VẼ GDI CHÍNH (DOUBLE-BUFFERING RENDER ENGINE)
 // ============================================================================
 
-/// Vẽ toàn bộ nội dung biểu đồ lên Memory DC (Double-Buffering)
-unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowState) {
+/// Vẽ toàn bộ nội dung biểu đồ lên Memory DC (Double-Buffering & DPI-Aware)
+unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowState, dpi: u32) {
     // 1. Tô nền toàn bộ cửa sổ #121417
     let full_rect = RECT {
         left: 0,
@@ -329,8 +436,8 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
         Vec::new()
     };
 
-    // 2. Vẽ Thanh chọn chế độ (Mode Tabs) trên đầu cửa sổ
-    let tab_font = create_chart_font(14, FW_MEDIUM.0 as i32);
+    // 2. Vẽ Thanh chọn chế độ (Mode Tabs) trên đầu cửa sổ - Font 13 pt Semi-Bold
+    let tab_font = create_chart_dpi_font(dpi, 13.0, FW_SEMIBOLD.0 as i32);
     let old_font = SelectObject(hdc, tab_font);
 
     let tab_border_pen = CreatePen(PS_SOLID, 1, COLOR_TAB_BORDER);
@@ -338,7 +445,7 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
     let old_pen = SelectObject(hdc, tab_border_pen);
 
     for &mode in &[ChartMode::TempAndFan, ChartMode::Power, ChartMode::Clock] {
-        let r = get_tab_rect(mode);
+        let r = get_tab_rect_dpi(mode, dpi);
         let is_active = state.active_mode == mode;
 
         // Nền nút tab
@@ -371,24 +478,40 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
             let _ = Polyline(hdc, &indicator_pts);
         }
 
-        // Nhãn văn bản của Tab
+        // Nhãn văn bản của Tab căn giữa hoàn hảo
         let label_color = if is_active {
             COLOR_CPU
         } else {
             COLOR_TEXT_MUTED
         };
-        let text_x = r.left + 10;
-        let text_y = r.top + 4;
-        draw_text_line(hdc, text_x, text_y, mode.label(), label_color);
+        SetTextColor(hdc, label_color);
+        let mut text_rect = RECT {
+            left: r.left,
+            top: r.top,
+            right: r.right,
+            bottom: r.bottom - 2,
+        };
+        let mut wide_label: Vec<u16> = mode.label().encode_utf16().collect();
+        let _ = DrawTextW(
+            hdc,
+            &mut wide_label,
+            &mut text_rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
     }
 
     let _ = SelectObject(hdc, old_pen);
     let _ = DeleteObject(tab_indicator_pen);
     let _ = DeleteObject(tab_border_pen);
 
-    // 3. Thanh trạng thái HUD thời gian thực (Live Infobar)
-    let hud_font = create_chart_font(15, FW_SEMIBOLD.0 as i32);
+    // 3. Thanh trạng thái HUD thời gian thực (Live Infobar) - Font 12.5 pt Semi-Bold
+    let tab_bottom = get_tab_rect_dpi(ChartMode::TempAndFan, dpi).bottom;
+    let hud_top = tab_bottom + scale_dpi(8, dpi);
+    let hud_h = scale_dpi(28, dpi);
+    let hud_font = create_chart_dpi_font(dpi, 12.5, FW_SEMIBOLD.0 as i32);
     let _ = SelectObject(hdc, hud_font);
+    let hud_x = scale_dpi(20, dpi);
+    let hud_text_y = hud_top + (hud_h - (12.5 * dpi as f32 / 72.0).round() as i32) / 2;
 
     match samples.last() {
         Some(s) => {
@@ -404,15 +527,28 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
                 s.gpu_power_w(),
                 s.gpu_ghz()
             );
-            draw_text_line(hdc, 20, 44, &cpu_hud, COLOR_CPU);
-            draw_text_line(hdc, 235, 44, "•", COLOR_TEXT_MUTED);
-            draw_text_line(hdc, 252, 44, &gpu_hud, COLOR_GPU);
+
+            let wide_cpu: Vec<u16> = cpu_hud.encode_utf16().collect();
+            let mut size_cpu = windows::Win32::Foundation::SIZE::default();
+            let _ = GetTextExtentPoint32W(hdc, &wide_cpu, &mut size_cpu);
+
+            let bullet = "   •   ";
+            let wide_bullet: Vec<u16> = bullet.encode_utf16().collect();
+            let mut size_bullet = windows::Win32::Foundation::SIZE::default();
+            let _ = GetTextExtentPoint32W(hdc, &wide_bullet, &mut size_bullet);
+
+            let x_bullet = hud_x + size_cpu.cx;
+            let x_gpu = x_bullet + size_bullet.cx;
+
+            draw_text_line(hdc, hud_x, hud_text_y, &cpu_hud, COLOR_CPU);
+            draw_text_line(hdc, x_bullet, hud_text_y, bullet, COLOR_TEXT_LIGHT);
+            draw_text_line(hdc, x_gpu, hud_text_y, &gpu_hud, COLOR_GPU);
         }
         None => {
             draw_text_line(
                 hdc,
-                20,
-                44,
+                hud_x,
+                hud_text_y,
                 "CPU: --°C | --.-W | -.-- GHz   •   GPU: --°C | --.-W | -.-- GHz (Đang thu thập dữ liệu...)",
                 COLOR_TEXT_MUTED,
             );
@@ -421,11 +557,11 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
 
     let _ = DeleteObject(hud_font);
 
-    // 4. Xác định vùng đồ thị (Plot Area): Lề trái 60, lề trên 72, lề phải 25, lề dưới 40
-    let plot_left = 60;
-    let plot_top = 72;
-    let plot_right = width - 25;
-    let plot_bottom = height - 40;
+    // 4. Xác định vùng đồ thị (Plot Area) thích ứng DPI
+    let plot_left = scale_dpi(66, dpi);
+    let plot_top = hud_top + hud_h + scale_dpi(10, dpi);
+    let plot_right = width - scale_dpi(25, dpi);
+    let plot_bottom = height - scale_dpi(40, dpi);
 
     let plot_width = plot_right - plot_left;
     let plot_height = plot_bottom - plot_top;
@@ -447,9 +583,9 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
     FillRect(hdc, &plot_rect, plot_brush);
     let _ = DeleteObject(plot_brush);
 
-    // Font chữ nhỏ cho trục tọa độ và nhãn
-    let label_font = create_chart_font(13, FW_NORMAL.0 as i32);
-    let _ = SelectObject(hdc, label_font);
+    // Font nhãn Trục Y - 11.5 pt
+    let y_label_font = create_chart_dpi_font(dpi, 11.5, FW_MEDIUM.0 as i32);
+    let _ = SelectObject(hdc, y_label_font);
 
     let grid_pen = CreatePen(PS_SOLID, 1, COLOR_GRID);
     let old_pen = SelectObject(hdc, grid_pen);
@@ -467,19 +603,39 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
                 let pts = [POINT { x: plot_left, y }, POINT { x: plot_right, y }];
                 let _ = Polyline(hdc, &pts);
 
-                // Nhãn nhiệt độ (°C) căn mép trái
+                // Nhãn nhiệt độ (°C) căn sát mép trái có đệm chuẩn
                 let label = format!("{:3}°C", temp);
-                draw_text_line(hdc, plot_left - 48, y - 7, &label, COLOR_TEXT_MUTED);
+                let wide_lbl: Vec<u16> = label.encode_utf16().collect();
+                let mut sz_lbl = windows::Win32::Foundation::SIZE::default();
+                let _ = GetTextExtentPoint32W(hdc, &wide_lbl, &mut sz_lbl);
+                let lbl_x = plot_left - sz_lbl.cx - scale_dpi(6, dpi);
+                let lbl_y = y - (sz_lbl.cy / 2);
+                draw_text_line(hdc, lbl_x, lbl_y, &label, COLOR_TEXT_LIGHT);
             }
 
-            // Đường cảnh báo 85°C (Nét đứt màu đỏ #E53935)
+            // Đường cảnh báo 85°C (Nét đứt màu đỏ rực rỡ)
             let warn_y = map_temp_y(85, plot_top, plot_bottom);
             let warn_pen = CreatePen(PS_DASH, 1, COLOR_WARN_85);
             let _ = SelectObject(hdc, warn_pen);
             let warn_pts = [POINT { x: plot_left, y: warn_y }, POINT { x: plot_right, y: warn_y }];
             let _ = Polyline(hdc, &warn_pts);
-            draw_text_line(hdc, plot_right - 88, warn_y - 15, "85°C Warning", COLOR_WARN_85);
             let _ = DeleteObject(warn_pen);
+
+            let warn_font = create_chart_dpi_font(dpi, 11.0, FW_BOLD.0 as i32);
+            let _ = SelectObject(hdc, warn_font);
+            let warn_text = "85°C Warning";
+            let wide_w: Vec<u16> = warn_text.encode_utf16().collect();
+            let mut sz_w = windows::Win32::Foundation::SIZE::default();
+            let _ = GetTextExtentPoint32W(hdc, &wide_w, &mut sz_w);
+            draw_text_line(
+                hdc,
+                plot_right - sz_w.cx - scale_dpi(10, dpi),
+                warn_y - sz_w.cy - scale_dpi(2, dpi),
+                warn_text,
+                COLOR_WARN_85,
+            );
+            let _ = DeleteObject(warn_font);
+            let _ = SelectObject(hdc, y_label_font);
             let _ = SelectObject(hdc, grid_pen);
         }
         ChartMode::Power => {
@@ -499,7 +655,12 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
 
                 // Nhãn công suất (W)
                 let label = format!("{:3} W", w_val);
-                draw_text_line(hdc, plot_left - 48, y - 7, &label, COLOR_TEXT_MUTED);
+                let wide_lbl: Vec<u16> = label.encode_utf16().collect();
+                let mut sz_lbl = windows::Win32::Foundation::SIZE::default();
+                let _ = GetTextExtentPoint32W(hdc, &wide_lbl, &mut sz_lbl);
+                let lbl_x = plot_left - sz_lbl.cx - scale_dpi(6, dpi);
+                let lbl_y = y - (sz_lbl.cy / 2);
+                draw_text_line(hdc, lbl_x, lbl_y, &label, COLOR_TEXT_LIGHT);
             }
         }
         ChartMode::Clock => {
@@ -514,12 +675,22 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
 
                 // Nhãn xung nhịp (GHz)
                 let label = format!("{:.1}G", ghz);
-                draw_text_line(hdc, plot_left - 48, y - 7, &label, COLOR_TEXT_MUTED);
+                let wide_lbl: Vec<u16> = label.encode_utf16().collect();
+                let mut sz_lbl = windows::Win32::Foundation::SIZE::default();
+                let _ = GetTextExtentPoint32W(hdc, &wide_lbl, &mut sz_lbl);
+                let lbl_x = plot_left - sz_lbl.cx - scale_dpi(6, dpi);
+                let lbl_y = y - (sz_lbl.cy / 2);
+                draw_text_line(hdc, lbl_x, lbl_y, &label, COLOR_TEXT_LIGHT);
             }
         }
     }
 
-    // 6. Trục X: Thời gian 1 giờ (3600 giây), các mốc: -60m .. Now
+    let _ = DeleteObject(y_label_font);
+
+    // 6. Trục X: Thời gian 1 giờ (3600 giây), các mốc: -60m .. Now - Font 11 pt
+    let x_label_font = create_chart_dpi_font(dpi, 11.0, FW_NORMAL.0 as i32);
+    let _ = SelectObject(hdc, x_label_font);
+
     let time_marks: [(i32, &str); 7] = [
         (60, "-60m"),
         (50, "-50m"),
@@ -539,13 +710,19 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
         let _ = Polyline(hdc, &x_pts);
 
         // Vạch chia nhỏ (tick) dưới plot
-        let tick_pts = [POINT { x, y: plot_bottom }, POINT { x, y: plot_bottom + 4 }];
+        let tick_pts = [POINT { x, y: plot_bottom }, POINT { x, y: plot_bottom + scale_dpi(4, dpi) }];
         let _ = Polyline(hdc, &tick_pts);
 
-        // Nhãn thời gian
-        let offset_x = if mins_ago == 0 { -12 } else { -16 };
-        draw_text_line(hdc, x + offset_x, plot_bottom + 8, mark_text, COLOR_TEXT_MUTED);
+        // Nhãn thời gian căn giữa
+        let wide_m: Vec<u16> = mark_text.encode_utf16().collect();
+        let mut sz_m = windows::Win32::Foundation::SIZE::default();
+        let _ = GetTextExtentPoint32W(hdc, &wide_m, &mut sz_m);
+        let lbl_x = x - (sz_m.cx / 2);
+        let lbl_y = plot_bottom + scale_dpi(6, dpi);
+        draw_text_line(hdc, lbl_x, lbl_y, mark_text, COLOR_TEXT_LIGHT);
     }
+
+    let _ = DeleteObject(x_label_font);
 
     // Viền khung Plot Area
     let border_pen = CreatePen(PS_SOLID, 1, COLOR_BORDER);
@@ -564,13 +741,20 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
     let mut mapped_samples: Vec<(i32, i32, i32, &TelemetrySample)> = Vec::with_capacity(samples.len());
 
     if samples.is_empty() {
+        let empty_font = create_chart_dpi_font(dpi, 12.0, FW_NORMAL.0 as i32);
+        let _ = SelectObject(hdc, empty_font);
+        let empty_msg = "Chưa có dữ liệu cảm biến (đang thu thập...)";
+        let wide_e: Vec<u16> = empty_msg.encode_utf16().collect();
+        let mut sz_e = windows::Win32::Foundation::SIZE::default();
+        let _ = GetTextExtentPoint32W(hdc, &wide_e, &mut sz_e);
         draw_text_line(
             hdc,
-            plot_left + (plot_width / 2) - 130,
-            plot_top + (plot_height / 2) - 8,
-            "Chưa có dữ liệu cảm biến (đang thu thập...)",
+            plot_left + (plot_width - sz_e.cx) / 2,
+            plot_top + (plot_height - sz_e.cy) / 2,
+            empty_msg,
             COLOR_TEXT_MUTED,
         );
+        let _ = DeleteObject(empty_font);
     } else {
         let newest_ts = samples.last().map(|s| s.timestamp_secs).unwrap_or(0);
 
@@ -638,7 +822,7 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
         }
     }
 
-    // 8. Tương tác chuột (Crosshair & Tooltip)
+    // 8. Tương tác chuột (Crosshair & Tooltip) - Font 11.5 pt Semi-Bold
     if let Some(m_pos) = state.mouse_pos {
         if m_pos.x >= plot_left && m_pos.x <= plot_right && m_pos.y >= plot_top && m_pos.y <= plot_bottom {
             if let Some(&(closest_x, cpu_y, gpu_y, sample)) = mapped_samples.iter().min_by_key(|(x, _, _, _)| (x - m_pos.x).abs()) {
@@ -692,20 +876,23 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
                     ),
                 };
 
-                // Vẽ hộp Tooltip
-                let tt_w = 176;
-                let tt_h = 76;
-                let mut tt_x = closest_x + 15;
+                // Vẽ hộp Tooltip thích ứng DPI
+                let tooltip_font = create_chart_dpi_font(dpi, 11.5, FW_SEMIBOLD.0 as i32);
+                let _ = SelectObject(hdc, tooltip_font);
+
+                let tt_w = scale_dpi(205, dpi);
+                let tt_h = scale_dpi(86, dpi);
+                let mut tt_x = closest_x + scale_dpi(15, dpi);
                 let mut tt_y = m_pos.y - (tt_h / 2);
 
-                if tt_x + tt_w > plot_right + 15 {
-                    tt_x = closest_x - tt_w - 15;
+                if tt_x + tt_w > plot_right + scale_dpi(15, dpi) {
+                    tt_x = closest_x - tt_w - scale_dpi(15, dpi);
                 }
-                if tt_y < plot_top + 5 {
-                    tt_y = plot_top + 5;
+                if tt_y < plot_top + scale_dpi(5, dpi) {
+                    tt_y = plot_top + scale_dpi(5, dpi);
                 }
-                if tt_y + tt_h > plot_bottom - 5 {
-                    tt_y = plot_bottom - tt_h - 5;
+                if tt_y + tt_h > plot_bottom - scale_dpi(5, dpi) {
+                    tt_y = plot_bottom - tt_h - scale_dpi(5, dpi);
                 }
 
                 let tt_rect = RECT {
@@ -731,9 +918,13 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
                 let _ = Polyline(hdc, &tt_box_pts);
                 let _ = DeleteObject(tt_border_pen);
 
-                draw_text_line(hdc, tt_x + 10, tt_y + 8, &time_str, COLOR_TEXT_LIGHT);
-                draw_text_line(hdc, tt_x + 10, tt_y + 28, &line_cpu, COLOR_CPU);
-                draw_text_line(hdc, tt_x + 10, tt_y + 48, &line_gpu, COLOR_GPU);
+                let pad = scale_dpi(10, dpi);
+                let line_h = scale_dpi(23, dpi);
+                draw_text_line(hdc, tt_x + pad, tt_y + pad, &time_str, COLOR_TEXT_LIGHT);
+                draw_text_line(hdc, tt_x + pad, tt_y + pad + line_h, &line_cpu, COLOR_CPU);
+                draw_text_line(hdc, tt_x + pad, tt_y + pad + line_h * 2, &line_gpu, COLOR_GPU);
+
+                let _ = DeleteObject(tooltip_font);
             }
         }
     }
@@ -743,7 +934,6 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
     let _ = DeleteObject(grid_pen);
 
     let _ = SelectObject(hdc, old_font);
-    let _ = DeleteObject(label_font);
     let _ = DeleteObject(tab_font);
 }
 
@@ -773,9 +963,10 @@ unsafe extern "system" fn chart_wndproc(
                 let hbm_mem = CreateCompatibleBitmap(hdc_screen, width, height);
                 let old_bm = SelectObject(hdc_mem, hbm_mem);
 
+                let dpi = get_window_dpi(hwnd);
                 let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ChartWindowState;
                 if let Some(state) = ptr.as_ref() {
-                    paint_chart(hdc_mem, width, height, state);
+                    paint_chart(hdc_mem, width, height, state, dpi);
                 }
 
                 let _ = BitBlt(hdc_screen, 0, 0, width, height, hdc_mem, 0, 0, SRCCOPY);
@@ -792,7 +983,8 @@ unsafe extern "system" fn chart_wndproc(
             let x = (lparam.0 & 0xFFFF) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
 
-            if let Some(new_mode) = hit_test_tab(x, y) {
+            let dpi = get_window_dpi(hwnd);
+            if let Some(new_mode) = hit_test_tab_dpi(x, y, dpi) {
                 let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ChartWindowState;
                 if let Some(state) = ptr.as_mut() {
                     if state.active_mode != new_mode {
@@ -860,10 +1052,11 @@ unsafe extern "system" fn chart_wndproc(
             LRESULT(0)
         }
         WM_GETMINMAXINFO => {
-            // Giới hạn kích thước tối thiểu khi người dùng co dãn cửa sổ
+            // Giới hạn kích thước tối thiểu khi người dùng co dãn cửa sổ (thích ứng DPI)
+            let dpi = get_window_dpi(hwnd);
             let mmi = &mut *(lparam.0 as *mut MINMAXINFO);
-            mmi.ptMinTrackSize.x = 550;
-            mmi.ptMinTrackSize.y = 360;
+            mmi.ptMinTrackSize.x = scale_dpi(600, dpi);
+            mmi.ptMinTrackSize.y = scale_dpi(400, dpi);
             LRESULT(0)
         }
         WM_CLOSE => {
@@ -1095,5 +1288,54 @@ mod tests {
             assert_eq!(stats.cpu_mhz_current, 4200);
             assert_eq!(stats.gpu_mhz_current, 2300);
         }
+    }
+
+    #[test]
+    fn test_dpi_scaling_helpers() {
+        // 96 DPI (100% scale)
+        assert_eq!(scale_dpi(96, 96), 96);
+        assert_eq!(scale_dpi(36, 96), 36);
+        assert_eq!(scale_dpi(28, 96), 28);
+
+        // 120 DPI (125% scale)
+        assert_eq!(scale_dpi(96, 120), 120);
+        assert_eq!(scale_dpi(36, 120), 45);
+        assert_eq!(scale_dpi(28, 120), 35);
+
+        // 144 DPI (150% scale)
+        assert_eq!(scale_dpi(96, 144), 144);
+        assert_eq!(scale_dpi(36, 144), 54);
+
+        // Font Em-Height: -MulDiv(pt, dpi, 72)
+        // 13 pt tại 96 DPI: -(13 * 96 / 72) = -17
+        assert_eq!(font_height_for_pt(13.0, 96), -17);
+        // 13 pt tại 120 DPI: -(13 * 120 / 72) = -22
+        assert_eq!(font_height_for_pt(13.0, 120), -22);
+        // 12.5 pt tại 120 DPI: -(12.5 * 120 / 72) = -21
+        assert_eq!(font_height_for_pt(12.5, 120), -21);
+        // 11.5 pt tại 120 DPI: -(11.5 * 120 / 72) = -19
+        assert_eq!(font_height_for_pt(11.5, 120), -19);
+        // 11.0 pt tại 120 DPI: -(11.0 * 120 / 72) = -18
+        assert_eq!(font_height_for_pt(11.0, 120), -18);
+    }
+
+    #[test]
+    fn test_tab_rect_and_hit_testing_at_120_dpi() {
+        let r0 = get_tab_rect_dpi(ChartMode::TempAndFan, 120);
+        let r1 = get_tab_rect_dpi(ChartMode::Power, 120);
+        let r2 = get_tab_rect_dpi(ChartMode::Clock, 120);
+
+        // Chiều cao tab tại 120 DPI (36 * 120 / 96 = 45 px)
+        assert_eq!(r0.bottom - r0.top, 45);
+        assert_eq!(r1.bottom - r1.top, 45);
+        assert_eq!(r2.bottom - r2.top, 45);
+
+        // Hit-test tại 120 DPI
+        assert_eq!(hit_test_tab_dpi(r0.left + 5, r0.top + 5, 120), Some(ChartMode::TempAndFan));
+        assert_eq!(hit_test_tab_dpi(r1.left + 5, r1.top + 5, 120), Some(ChartMode::Power));
+        assert_eq!(hit_test_tab_dpi(r2.left + 5, r2.top + 5, 120), Some(ChartMode::Clock));
+
+        // Ngoài vùng tab tại 120 DPI
+        assert_eq!(hit_test_tab_dpi(0, 0, 120), None);
     }
 }

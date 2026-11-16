@@ -14,8 +14,10 @@ use std::thread;
 use windows::core::{w, PCWSTR, Result};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DeleteObject, GetStockObject, SetBkMode, SetTextColor,
-    DEFAULT_GUI_FONT, HDC, TRANSPARENT,
+    CreateFontW, CreateSolidBrush, DeleteObject, GetDC, GetDeviceCaps, GetStockObject, ReleaseDC,
+    SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
+    FW_SEMIBOLD, HDC, HFONT, LOGPIXELSX, NULL_BRUSH, OUT_DEFAULT_PRECIS, TRANSPARENT,
+    VARIABLE_PITCH,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -51,6 +53,58 @@ const BST_UNCHECKED: usize = 0;
 
 use std::sync::Arc;
 
+/// Helper tỉ lệ tọa độ theo DPI (MulDiv(val, dpi, 96))
+#[inline]
+pub fn scale_dpi(val: i32, dpi: u32) -> i32 {
+    (val * dpi as i32 + 48) / 96
+}
+
+/// Tính toán chiều cao Font theo Point Size chuẩn Em-Height (-MulDiv(point_size, dpi, 72))
+#[inline]
+pub fn font_height_for_pt(pt: f32, dpi: u32) -> i32 {
+    let h = (pt * (dpi as f32) / 72.0).round() as i32;
+    -h.max(1)
+}
+
+/// Truy vấn DPI của cửa sổ Win32 (GetDpiForWindow, fallback 96 nếu không khả dụng)
+pub unsafe fn get_window_dpi(hwnd: HWND) -> u32 {
+    type GetDpiForWindowFn = unsafe extern "system" fn(HWND) -> u32;
+    if let Ok(user32) = windows::Win32::System::LibraryLoader::GetModuleHandleW(w!("user32.dll")) {
+        if let Some(func) = windows::Win32::System::LibraryLoader::GetProcAddress(
+            user32,
+            windows::core::s!("GetDpiForWindow"),
+        ) {
+            let func: GetDpiForWindowFn = std::mem::transmute(func);
+            let dpi = func(hwnd);
+            if dpi > 0 {
+                return dpi;
+            }
+        }
+    }
+    96
+}
+
+/// Helper tạo HFONT Segoe UI DPI-Aware chuẩn Em-Height (-MulDiv(point_size, dpi, 72))
+unsafe fn create_dialog_dpi_font(dpi: u32, point_size: f32, weight: i32) -> HFONT {
+    let height = font_height_for_pt(point_size, dpi);
+    CreateFontW(
+        height,
+        0,
+        0,
+        0,
+        weight,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET.0 as u32,
+        OUT_DEFAULT_PRECIS.0 as u32,
+        CLIP_DEFAULT_PRECIS.0 as u32,
+        CLEARTYPE_QUALITY.0 as u32,
+        VARIABLE_PITCH.0 as u32,
+        w!("Segoe UI"),
+    )
+}
+
 /// Cấu trúc lưu trữ handles của các Edit control để đọc/ghi dữ liệu
 struct DialogControls {
     cpu_temp_edits: [HWND; 4],
@@ -62,6 +116,8 @@ struct DialogControls {
     telemetry_lbl: HWND,
     state: Option<Arc<crate::tray::TrayState>>,
     cmd_sender: Sender<TrayCommand>,
+    font_main: HFONT,
+    font_btn: HFONT,
 }
 
 /// Mở cửa sổ cấu hình Fan Curve (Chạy trên một thread độc lập để không khóa System Tray)
@@ -112,9 +168,14 @@ fn run_dialog_window(cmd_sender: Sender<TrayCommand>, state: Option<Arc<crate::t
 
         let _ = RegisterClassW(&wnd_class);
 
-        // Tính toán kích thước cửa sổ và căn giữa màn hình
-        let width = 530;
-        let height = 555;
+        // Tính toán kích thước cửa sổ và căn giữa màn hình thích ứng DPI
+        let hdc_screen = GetDC(HWND::default());
+        let initial_dpi = GetDeviceCaps(hdc_screen, LOGPIXELSX) as u32;
+        let _ = ReleaseDC(HWND::default(), hdc_screen);
+        let initial_dpi = if initial_dpi > 0 { initial_dpi } else { 96 };
+
+        let width = scale_dpi(560, initial_dpi);
+        let height = scale_dpi(590, initial_dpi);
         let screen_w = GetSystemMetrics(SM_CXSCREEN);
         let screen_h = GetSystemMetrics(SM_CYSCREEN);
         let pos_x = (screen_w - width) / 2;
@@ -169,14 +230,20 @@ fn run_dialog_window(cmd_sender: Sender<TrayCommand>, state: Option<Arc<crate::t
     }
 }
 
-/// Tạo tất cả các Label, GroupBox, Edit và Button controls bằng Pure Win32
+/// Tạo tất cả các Label, GroupBox, Edit và Button controls bằng Pure Win32 (DPI-Aware Segoe UI)
 unsafe fn create_dialog_controls(
     parent: HWND,
     cmd_sender: Sender<TrayCommand>,
     state: Option<Arc<crate::tray::TrayState>>,
 ) -> Result<DialogControls> {
     let hinstance = GetModuleHandleW(PCWSTR::null())?;
-    let font = GetStockObject(DEFAULT_GUI_FONT);
+    let dpi = get_window_dpi(parent);
+    let s = |v: i32| scale_dpi(v, dpi);
+
+    // Font nhãn và ô nhập: 12 pt Semi-Bold Segoe UI DPI-aware
+    let font_main = create_dialog_dpi_font(dpi, 12.0, FW_SEMIBOLD.0 as i32);
+    // Font nút bấm và groupbox header: 12.5 pt Semi-Bold Segoe UI DPI-aware
+    let font_btn = create_dialog_dpi_font(dpi, 12.5, FW_SEMIBOLD.0 as i32);
 
     // Tiêu đề hướng dẫn
     let h_info = CreateWindowExW(
@@ -184,10 +251,10 @@ unsafe fn create_dialog_controls(
         w!("STATIC"),
         w!("Thiết lập nhiệt độ (°C) và tốc độ quạt (%). Quạt sẽ phản ứng tức thì không có độ trễ lọc."),
         WS_CHILD | WS_VISIBLE,
-        15, 12, 490, 20,
+        s(15), s(12), s(525), s(24),
         parent, HMENU::default(), hinstance, None,
     )?;
-    SendMessageW(h_info, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    SendMessageW(h_info, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
 
     // --- GROUP BOX CPU ---
     let h_cpu_group = CreateWindowExW(
@@ -195,16 +262,16 @@ unsafe fn create_dialog_controls(
         w!("BUTTON"),
         w!(" Đường cong quạt CPU (CPU Fan Curve) "),
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(0x0007), // BS_GROUPBOX = 0x0007
-        15, 38, 485, 142,
+        s(15), s(38), s(520), s(146),
         parent, HMENU::default(), hinstance, None,
     )?;
-    SendMessageW(h_cpu_group, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    SendMessageW(h_cpu_group, WM_SETFONT, WPARAM(font_btn.0 as usize), LPARAM(1));
 
     let mut cpu_temp_edits = [HWND::default(); 4];
     let mut cpu_speed_edits = [HWND::default(); 4];
 
     for i in 0..4 {
-        let y = 62 + (i as i32 * 26);
+        let y = s(64 + (i as i32 * 27));
         let label_text = format!("Mốc {}:\0", i + 1);
         let wide_label: Vec<u16> = label_text.encode_utf16().collect();
         let h_lbl = CreateWindowExW(
@@ -212,10 +279,10 @@ unsafe fn create_dialog_controls(
             w!("STATIC"),
             PCWSTR(wide_label.as_ptr()),
             WS_CHILD | WS_VISIBLE,
-            35, y + 2, 55, 20,
+            s(32), y + s(2), s(60), s(22),
             parent, HMENU::default(), hinstance, None,
         )?;
-        SendMessageW(h_lbl, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        SendMessageW(h_lbl, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
 
         // Nhãn Nhiệt độ
         let h_t_lbl = CreateWindowExW(
@@ -223,10 +290,10 @@ unsafe fn create_dialog_controls(
             w!("STATIC"),
             w!("Nhiệt độ:"),
             WS_CHILD | WS_VISIBLE,
-            95, y + 2, 60, 20,
+            s(98), y + s(2), s(65), s(22),
             parent, HMENU::default(), hinstance, None,
         )?;
-        SendMessageW(h_t_lbl, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        SendMessageW(h_t_lbl, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
 
         // Edit box Nhiệt độ (ES_NUMBER = 0x2000 | WS_BORDER = 0x00800000)
         let h_t_edit = CreateWindowExW(
@@ -234,10 +301,10 @@ unsafe fn create_dialog_controls(
             w!("EDIT"),
             w!("0"),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WINDOW_STYLE(0x2000 | 0x0001), // ES_NUMBER | ES_CENTER
-            158, y, 50, 22,
+            s(168), y, s(52), s(24),
             parent, HMENU((ID_CPU_TEMP_BASE + i) as *mut _), hinstance, None,
         )?;
-        SendMessageW(h_t_edit, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        SendMessageW(h_t_edit, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
         cpu_temp_edits[i] = h_t_edit;
 
         let h_c_unit = CreateWindowExW(
@@ -245,10 +312,10 @@ unsafe fn create_dialog_controls(
             w!("STATIC"),
             w!("°C   -->   Tốc độ quạt:"),
             WS_CHILD | WS_VISIBLE,
-            214, y + 2, 125, 20,
+            s(228), y + s(2), s(138), s(22),
             parent, HMENU::default(), hinstance, None,
         )?;
-        SendMessageW(h_c_unit, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        SendMessageW(h_c_unit, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
 
         // Edit box Tốc độ
         let h_s_edit = CreateWindowExW(
@@ -256,10 +323,10 @@ unsafe fn create_dialog_controls(
             w!("EDIT"),
             w!("0"),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WINDOW_STYLE(0x2000 | 0x0001),
-            345, y, 50, 22,
+            s(372), y, s(52), s(24),
             parent, HMENU((ID_CPU_SPEED_BASE + i) as *mut _), hinstance, None,
         )?;
-        SendMessageW(h_s_edit, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        SendMessageW(h_s_edit, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
         cpu_speed_edits[i] = h_s_edit;
 
         let h_pct = CreateWindowExW(
@@ -267,10 +334,10 @@ unsafe fn create_dialog_controls(
             w!("STATIC"),
             w!("%"),
             WS_CHILD | WS_VISIBLE,
-            400, y + 2, 20, 20,
+            s(432), y + s(2), s(25), s(22),
             parent, HMENU::default(), hinstance, None,
         )?;
-        SendMessageW(h_pct, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        SendMessageW(h_pct, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
     }
 
     // --- GROUP BOX GPU ---
@@ -279,16 +346,16 @@ unsafe fn create_dialog_controls(
         w!("BUTTON"),
         w!(" Đường cong quạt GPU (GPU Fan Curve) "),
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(0x0007),
-        15, 190, 485, 118,
+        s(15), s(192), s(520), s(122),
         parent, HMENU::default(), hinstance, None,
     )?;
-    SendMessageW(h_gpu_group, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    SendMessageW(h_gpu_group, WM_SETFONT, WPARAM(font_btn.0 as usize), LPARAM(1));
 
     let mut gpu_temp_edits = [HWND::default(); 3];
     let mut gpu_speed_edits = [HWND::default(); 3];
 
     for i in 0..3 {
-        let y = 214 + (i as i32 * 26);
+        let y = s(218 + (i as i32 * 27));
         let label_text = format!("Mốc {}:\0", i + 1);
         let wide_label: Vec<u16> = label_text.encode_utf16().collect();
         let h_lbl = CreateWindowExW(
@@ -296,30 +363,30 @@ unsafe fn create_dialog_controls(
             w!("STATIC"),
             PCWSTR(wide_label.as_ptr()),
             WS_CHILD | WS_VISIBLE,
-            35, y + 2, 55, 20,
+            s(32), y + s(2), s(60), s(22),
             parent, HMENU::default(), hinstance, None,
         )?;
-        SendMessageW(h_lbl, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        SendMessageW(h_lbl, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
 
         let h_t_lbl = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             w!("STATIC"),
             w!("Nhiệt độ:"),
             WS_CHILD | WS_VISIBLE,
-            95, y + 2, 60, 20,
+            s(98), y + s(2), s(65), s(22),
             parent, HMENU::default(), hinstance, None,
         )?;
-        SendMessageW(h_t_lbl, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        SendMessageW(h_t_lbl, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
 
         let h_t_edit = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             w!("EDIT"),
             w!("0"),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WINDOW_STYLE(0x2000 | 0x0001),
-            158, y, 50, 22,
+            s(168), y, s(52), s(24),
             parent, HMENU((ID_GPU_TEMP_BASE + i) as *mut _), hinstance, None,
         )?;
-        SendMessageW(h_t_edit, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        SendMessageW(h_t_edit, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
         gpu_temp_edits[i] = h_t_edit;
 
         let h_c_unit = CreateWindowExW(
@@ -327,20 +394,20 @@ unsafe fn create_dialog_controls(
             w!("STATIC"),
             w!("°C   -->   Tốc độ quạt:"),
             WS_CHILD | WS_VISIBLE,
-            214, y + 2, 125, 20,
+            s(228), y + s(2), s(138), s(22),
             parent, HMENU::default(), hinstance, None,
         )?;
-        SendMessageW(h_c_unit, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        SendMessageW(h_c_unit, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
 
         let h_s_edit = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             w!("EDIT"),
             w!("0"),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WINDOW_STYLE(0x2000 | 0x0001),
-            345, y, 50, 22,
+            s(372), y, s(52), s(24),
             parent, HMENU((ID_GPU_SPEED_BASE + i) as *mut _), hinstance, None,
         )?;
-        SendMessageW(h_s_edit, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        SendMessageW(h_s_edit, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
         gpu_speed_edits[i] = h_s_edit;
 
         let h_pct = CreateWindowExW(
@@ -348,10 +415,10 @@ unsafe fn create_dialog_controls(
             w!("STATIC"),
             w!("%"),
             WS_CHILD | WS_VISIBLE,
-            400, y + 2, 20, 20,
+            s(432), y + s(2), s(25), s(22),
             parent, HMENU::default(), hinstance, None,
         )?;
-        SendMessageW(h_pct, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        SendMessageW(h_pct, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
     }
 
     // --- GROUP BOX THERMAL GOVERNOR ---
@@ -360,10 +427,10 @@ unsafe fn create_dialog_controls(
         w!("BUTTON"),
         w!(" Khóa nhiệt độ CPU mục tiêu (Smooth EPP Governor) "),
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(0x0007), // BS_GROUPBOX
-        15, 318, 485, 76,
+        s(15), s(322), s(520), s(84),
         parent, HMENU::default(), hinstance, None,
     )?;
-    SendMessageW(h_gov_group, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    SendMessageW(h_gov_group, WM_SETFONT, WPARAM(font_btn.0 as usize), LPARAM(1));
 
     // Checkbox: Kích hoạt Khóa nhiệt độ CPU
     let h_gov_chk = CreateWindowExW(
@@ -371,10 +438,10 @@ unsafe fn create_dialog_controls(
         w!("BUTTON"),
         w!("Kích hoạt Khóa nhiệt độ CPU (Intel Speed Shift EPP - Zero Stuttering)"),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(0x0003), // BS_AUTOCHECKBOX = 0x0003
-        35, 340, 440, 22,
+        s(32), s(346), s(485), s(24),
         parent, HMENU(ID_CHK_GOVERNOR_ENABLED as *mut _), hinstance, None,
     )?;
-    SendMessageW(h_gov_chk, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    SendMessageW(h_gov_chk, WM_SETFONT, WPARAM(font_btn.0 as usize), LPARAM(1));
 
     // Nhãn: Nhiệt độ CPU mục tiêu
     let h_gov_lbl = CreateWindowExW(
@@ -382,10 +449,10 @@ unsafe fn create_dialog_controls(
         w!("STATIC"),
         w!("Nhiệt độ CPU mục tiêu:"),
         WS_CHILD | WS_VISIBLE,
-        35, 365, 145, 20,
+        s(32), s(374), s(158), s(22),
         parent, HMENU::default(), hinstance, None,
     )?;
-    SendMessageW(h_gov_lbl, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    SendMessageW(h_gov_lbl, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
 
     // Edit: Nhiệt độ mục tiêu
     let h_gov_edit = CreateWindowExW(
@@ -393,21 +460,20 @@ unsafe fn create_dialog_controls(
         w!("EDIT"),
         w!("80"),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WINDOW_STYLE(0x2000 | 0x0001), // ES_NUMBER | ES_CENTER
-        185, 363, 50, 22,
+        s(195), s(372), s(52), s(24),
         parent, HMENU(ID_EDIT_GOVERNOR_TARGET as *mut _), hinstance, None,
     )?;
-    SendMessageW(h_gov_edit, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    SendMessageW(h_gov_edit, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
 
-    // Đơn vị và giải thích
     let h_gov_hint = CreateWindowExW(
         WINDOW_EX_STYLE::default(),
         w!("STATIC"),
-        w!("°C   (Khuyên dùng: 75°C - 85°C. Điều tiết EPP mượt mà, không tắt Turbo Boost)"),
+        w!("°C   (Khuyên dùng: 75°C - 85°C. Mượt mà, không tắt Boost)"),
         WS_CHILD | WS_VISIBLE,
-        242, 365, 250, 20,
+        s(255), s(374), s(270), s(22),
         parent, HMENU::default(), hinstance, None,
     )?;
-    SendMessageW(h_gov_hint, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    SendMessageW(h_gov_hint, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
 
     // --- PRESETS NHANH ---
     let h_pre_lbl = CreateWindowExW(
@@ -415,40 +481,40 @@ unsafe fn create_dialog_controls(
         w!("STATIC"),
         w!("Mẫu thiết lập sẵn:"),
         WS_CHILD | WS_VISIBLE,
-        15, 406, 120, 20,
+        s(15), s(418), s(130), s(24),
         parent, HMENU::default(), hinstance, None,
     )?;
-    SendMessageW(h_pre_lbl, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    SendMessageW(h_pre_lbl, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
 
     let btn_preset_def = CreateWindowExW(
         WINDOW_EX_STYLE::default(),
         w!("BUTTON"),
         w!("Mặc định (Default)"),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-        140, 402, 115, 26,
+        s(150), s(414), s(122), s(28),
         parent, HMENU(ID_BTN_PRESET_DEFAULT as *mut _), hinstance, None,
     )?;
-    SendMessageW(btn_preset_def, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    SendMessageW(btn_preset_def, WM_SETFONT, WPARAM(font_btn.0 as usize), LPARAM(1));
 
     let btn_preset_game = CreateWindowExW(
         WINDOW_EX_STYLE::default(),
         w!("BUTTON"),
         w!("Tản nhiệt cao (Gaming)"),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-        262, 402, 135, 26,
+        s(280), s(414), s(142), s(28),
         parent, HMENU(ID_BTN_PRESET_GAMING as *mut _), hinstance, None,
     )?;
-    SendMessageW(btn_preset_game, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    SendMessageW(btn_preset_game, WM_SETFONT, WPARAM(font_btn.0 as usize), LPARAM(1));
 
     let btn_preset_silent = CreateWindowExW(
         WINDOW_EX_STYLE::default(),
         w!("BUTTON"),
         w!("Yên tĩnh (Silent)"),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-        404, 402, 96, 26,
+        s(430), s(414), s(105), s(28),
         parent, HMENU(ID_BTN_PRESET_SILENT as *mut _), hinstance, None,
     )?;
-    SendMessageW(btn_preset_silent, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    SendMessageW(btn_preset_silent, WM_SETFONT, WPARAM(font_btn.0 as usize), LPARAM(1));
 
     // --- NÚT HÀNH ĐỘNG DƯỚI CÙNG ---
     let btn_save = CreateWindowExW(
@@ -456,30 +522,30 @@ unsafe fn create_dialog_controls(
         w!("BUTTON"),
         w!("Áp dụng & Lưu cấu hình"),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(0x0001), // BS_DEFPUSHBUTTON
-        15, 440, 180, 32,
+        s(15), s(452), s(195), s(34),
         parent, HMENU(ID_BTN_SAVE_APPLY as *mut _), hinstance, None,
     )?;
-    SendMessageW(btn_save, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    SendMessageW(btn_save, WM_SETFONT, WPARAM(font_btn.0 as usize), LPARAM(1));
 
     let btn_open = CreateWindowExW(
         WINDOW_EX_STYLE::default(),
         w!("BUTTON"),
         w!("Mở file config.toml"),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-        210, 440, 160, 32,
+        s(220), s(452), s(175), s(34),
         parent, HMENU(ID_BTN_OPEN_CONFIG as *mut _), hinstance, None,
     )?;
-    SendMessageW(btn_open, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    SendMessageW(btn_open, WM_SETFONT, WPARAM(font_btn.0 as usize), LPARAM(1));
 
     let btn_close = CreateWindowExW(
         WINDOW_EX_STYLE::default(),
         w!("BUTTON"),
         w!("Đóng"),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-        385, 440, 115, 32,
+        s(405), s(452), s(130), s(34),
         parent, HMENU(ID_BTN_CLOSE as *mut _), hinstance, None,
     )?;
-    SendMessageW(btn_close, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    SendMessageW(btn_close, WM_SETFONT, WPARAM(font_btn.0 as usize), LPARAM(1));
 
     // --- KHUNG HIỂN THỊ THÔNG SỐ THỜI GIAN THỰC (LIVE TELEMETRY) ---
     let h_telemetry = CreateWindowExW(
@@ -487,10 +553,10 @@ unsafe fn create_dialog_controls(
         w!("STATIC"),
         w!("Trạng thái phần cứng: Đang nạp cảm biến..."),
         WS_CHILD | WS_VISIBLE,
-        15, 482, 485, 22,
+        s(15), s(496), s(520), s(26),
         parent, HMENU::default(), hinstance, None,
     )?;
-    SendMessageW(h_telemetry, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    SendMessageW(h_telemetry, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
 
     Ok(DialogControls {
         cpu_temp_edits,
@@ -502,6 +568,8 @@ unsafe fn create_dialog_controls(
         telemetry_lbl: h_telemetry,
         state,
         cmd_sender,
+        font_main,
+        font_btn,
     })
 }
 
@@ -694,8 +762,8 @@ unsafe extern "system" fn dialog_wndproc(
             // Đảm bảo chữ trên STATIC label rõ nét, nền đồng màu với dialog
             let hdc = HDC(wparam.0 as *mut _);
             SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, COLORREF(0x00202020));
-            let brush = GetStockObject(DEFAULT_GUI_FONT); // Hoặc trả về stock brush
+            SetTextColor(hdc, COLORREF(0x001A1A1A));
+            let brush = GetStockObject(NULL_BRUSH);
             LRESULT(brush.0 as isize)
         }
         WM_TIMER => {
@@ -738,12 +806,36 @@ unsafe extern "system" fn dialog_wndproc(
             let _ = KillTimer(hwnd, 101);
             let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DialogControls;
             if !ptr.is_null() {
-                let _ = Box::from_raw(ptr);
+                let controls = Box::from_raw(ptr);
+                let _ = DeleteObject(controls.font_main);
+                let _ = DeleteObject(controls.font_btn);
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             }
             PostQuitMessage(0);
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_curve_dialog_dpi_and_font_helpers() {
+        // 96 DPI
+        assert_eq!(scale_dpi(560, 96), 560);
+        assert_eq!(scale_dpi(590, 96), 590);
+        assert_eq!(font_height_for_pt(12.0, 96), -16);
+        assert_eq!(font_height_for_pt(12.5, 96), -17);
+        assert_eq!(font_height_for_pt(13.0, 96), -17);
+
+        // 120 DPI (125% scaling)
+        assert_eq!(scale_dpi(560, 120), 700);
+        assert_eq!(scale_dpi(590, 120), 738);
+        assert_eq!(font_height_for_pt(12.0, 120), -20);
+        assert_eq!(font_height_for_pt(12.5, 120), -21);
+        assert_eq!(font_height_for_pt(13.0, 120), -22);
     }
 }

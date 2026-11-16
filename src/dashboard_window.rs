@@ -24,8 +24,14 @@ use windows::core::{w, PCWSTR, Result};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TRACKMOUSEEVENT, TME_LEAVE};
 use windows::Win32::UI::WindowsAndMessaging::*;
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn MulDiv(n_number: i32, n_numerator: i32, n_denominator: i32) -> i32;
+}
 
 use crate::telemetry::TelemetryHistory;
 use crate::tray::{FanProfile, TrayCommand, TrayState};
@@ -77,10 +83,10 @@ impl AppTheme {
                 btn_norm: rgb(30, 34, 41),    // #1E2229
                 btn_hover: rgb(40, 46, 56),   // #282E38
                 btn_pressed: rgb(15, 17, 20), // #0F1114
-                cpu: rgb(0, 229, 255),        // #00E5FF
-                gpu: rgb(255, 145, 0),        // #FF9100
-                text: rgb(236, 239, 244),     // #ECEFF4
-                text_sec: rgb(139, 148, 158), // #8B949E
+                cpu: rgb(0, 240, 255),        // #00F0FF (Electric Cyan sáng rực)
+                gpu: rgb(255, 167, 38),       // #FFA726 (Vàng cam sáng)
+                text: rgb(248, 250, 252),     // #F8FAFC (Trắng ngọc siêu sáng rõ)
+                text_sec: rgb(208, 217, 230), // #D0D9E6 (Sáng rõ nét, độ tương phản cực cao trên nền #16191E)
                 danger: rgb(255, 59, 48),     // #FF3B30
                 active_bg: rgb(0, 65, 80),    // Dark cyan tint
                 bar_bg: rgb(15, 17, 20),      // Bar track #0F1114
@@ -267,7 +273,7 @@ pub fn compute_dashboard_layout(
 
     // 1. Nút đổi Giao diện (Header Theme Toggle)
     let theme_btn_rect = RECT {
-        left: w - 110,
+        left: w - 120,
         top: 10,
         right: w - 16,
         bottom: 38,
@@ -275,13 +281,13 @@ pub fn compute_dashboard_layout(
 
     // Phân bổ chiều dọc linh hoạt (Responsive Vertical Distribution)
     let available_content = (h - 48 - 16).max(340);
-    let card_h = (available_content * 35 / 100).clamp(138, 240);
+    let card_h = (available_content * 38 / 100).clamp(145, 260);
     let card_bottom = 48 + card_h;
 
-    let base_gap = ((available_content - (card_h + 38 + 38 + 78)) / 4).clamp(6, 20);
+    let base_gap = ((available_content - (card_h + 34 + 34 + 72)) / 4).clamp(6, 20);
 
     let prof_y_top = card_bottom + base_gap;
-    let prof_h = (available_content * 9 / 100).clamp(36, 48);
+    let prof_h = (available_content * 9 / 100).clamp(34, 48);
     let prof_y_bottom = prof_y_top + prof_h;
 
     let epp_y_top = prof_y_bottom + base_gap;
@@ -341,10 +347,10 @@ pub fn compute_dashboard_layout(
         right: w - 16,
         bottom: epp_y_bottom,
     };
-    let epp_btn_h = 28.min(epp_h - 8);
+    let epp_btn_h = 30.min(epp_h - 4);
     let epp_btn_top = epp_y_top + (epp_h - epp_btn_h) / 2;
     let epp_btn_rect = RECT {
-        left: w - 16 - 130,
+        left: w - 16 - 135,
         top: epp_btn_top,
         right: w - 24,
         bottom: epp_btn_top + epp_btn_h,
@@ -540,9 +546,11 @@ fn run_dashboard_window(
 
         let _ = RegisterClassW(&wnd_class);
 
-        // Kích thước chuẩn 540 x 450 px, căn giữa màn hình
-        let width = 540;
-        let height = 450;
+        // Kích thước chuẩn cơ sở: 600 x 500 px, nhân theo tỉ lệ DPI thực tế
+        let sys_dpi = GetDpiForSystem();
+        let dpi = if sys_dpi == 0 { 96 } else { sys_dpi as i32 };
+        let width = MulDiv(600, dpi, 96);
+        let height = MulDiv(500, dpi, 96);
         let screen_w = GetSystemMetrics(SM_CXSCREEN);
         let screen_h = GetSystemMetrics(SM_CYSCREEN);
         let pos_x = (screen_w - width) / 2;
@@ -597,8 +605,44 @@ fn run_dashboard_window(
     }
 }
 
-/// Helper tạo HFONT Segoe UI
-unsafe fn create_font(height: i32, weight: i32) -> HFONT {
+/// Chuẩn hóa hàm tạo Font DPI-Aware
+unsafe fn create_dpi_font(hwnd: HWND, point_size: i32, weight: i32) -> HFONT {
+    let dpi = GetDpiForWindow(hwnd);
+    let dpi = if dpi == 0 {
+        let s = GetDpiForSystem();
+        if s == 0 { 96 } else { s as i32 }
+    } else {
+        dpi as i32
+    };
+    let height = -MulDiv(point_size, dpi, 72);
+    CreateFontW(
+        height,
+        0,
+        0,
+        0,
+        weight,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET.0 as u32,
+        OUT_DEFAULT_PRECIS.0 as u32,
+        CLIP_DEFAULT_PRECIS.0 as u32,
+        CLEARTYPE_QUALITY.0 as u32,
+        VARIABLE_PITCH.0 as u32,
+        w!("Segoe UI"),
+    )
+}
+
+/// Tạo Font DPI-Aware với kích thước lẻ (1/10 point)
+unsafe fn create_dpi_font_tenth(hwnd: HWND, point_size_x10: i32, weight: i32) -> HFONT {
+    let dpi = GetDpiForWindow(hwnd);
+    let dpi = if dpi == 0 {
+        let s = GetDpiForSystem();
+        if s == 0 { 96 } else { s as i32 }
+    } else {
+        dpi as i32
+    };
+    let height = -MulDiv(point_size_x10, dpi, 720);
     CreateFontW(
         height,
         0,
@@ -717,6 +761,7 @@ unsafe fn draw_tactile_button(
 
 /// Vẽ toàn bộ nội dung Dashboard lên Memory DC (Double-Buffering thuần)
 unsafe fn paint_dashboard(
+    hwnd: HWND,
     hdc: HDC,
     width: i32,
     height: i32,
@@ -739,22 +784,23 @@ unsafe fn paint_dashboard(
 
     SetBkMode(hdc, TRANSPARENT);
 
-    // Khởi tạo các Font cần thiết
-    let font_title = create_font(17, FW_BOLD.0 as i32);
-    let font_card_header = create_font(14, FW_BOLD.0 as i32);
-    let font_temp = create_font(36, FW_BOLD.0 as i32); // 27pt Segoe UI Bold
-    let font_small = create_font(13, FW_NORMAL.0 as i32);
-    let font_body = create_font(14, FW_NORMAL.0 as i32);
-    let font_body_bold = create_font(14, FW_SEMIBOLD.0 as i32);
+    // Khởi tạo các Font DPI-Aware sắc nét, kích thước chuẩn
+    let font_title = create_dpi_font(hwnd, 16, FW_BOLD.0 as i32);
+    let font_card_header = create_dpi_font(hwnd, 13, FW_BOLD.0 as i32);
+    let font_temp = create_dpi_font(hwnd, 34, FW_BOLD.0 as i32); // 34 pt Segoe UI Bold (to, sắc sảo, siêu rõ ràng)
+    let font_small = create_dpi_font(hwnd, 12, FW_SEMIBOLD.0 as i32); // 12 pt Semi-Bold
+    let font_body = create_dpi_font(hwnd, 13, FW_SEMIBOLD.0 as i32); // 13 pt Semi-Bold
+    let font_body_bold = create_dpi_font_tenth(hwnd, 135, FW_BOLD.0 as i32); // 13.5 pt Bold
 
     // 2. Header Bar (Y: 10..42)
     let old_font = SelectObject(hdc, font_title);
-    draw_text_line(hdc, 16, 14, "PREDATOR FAN CONTROL // DASHBOARD", palette.text);
+    draw_text_line(hdc, 16, 12, "PREDATOR FAN CONTROL // DASHBOARD", palette.text);
 
     // Thông báo trạng thái hot-reload config (nếu có nháy flash)
     if snapshot.reload_flash_ticks > 0 {
         let _ = SelectObject(hdc, font_body_bold);
-        draw_text_line(hdc, 270, 16, "✓ Đã tải lại cấu hình!", rgb(76, 175, 80));
+        let flash_x = (width - 16 - 120 - 180).max(16);
+        draw_text_line(hdc, flash_x, 14, "✓ Đã tải lại cấu hình!", rgb(76, 175, 80));
     }
 
     // 3. Telemetry Cards (CPU & GPU) từ Layout động
@@ -792,13 +838,20 @@ unsafe fn paint_dashboard(
     let _ = DeleteObject(card_brush);
     let _ = DeleteObject(card_pen);
 
-    // Nội dung CPU Card
+    let card_h = cpu_card_rect.bottom - cpu_card_rect.top;
+    let header_rel_y = (card_h * 7 / 100).clamp(10, 16);
+    let temp_rel_y = header_rel_y + (card_h * 15 / 100).clamp(20, 26);
+    let metric_rel_y = (card_h * 54 / 100).clamp(80, 130);
+    let track_rel_y = (card_h * 70 / 100).clamp(104, 168);
+    let fan_info_rel_y = track_rel_y + 16;
+
+    // --- Nội dung CPU Card ---
     let _ = SelectObject(hdc, font_card_header);
-    draw_text_line(hdc, cpu_card_rect.left + 14, cpu_card_rect.top + 12, "CPU TELEMETRY", palette.cpu);
+    draw_text_line(hdc, cpu_card_rect.left + 14, cpu_card_rect.top + header_rel_y, "CPU TELEMETRY", palette.cpu);
 
     let _ = SelectObject(hdc, font_temp);
     let cpu_temp_str = format!("{}°C", snapshot.cpu_temp);
-    draw_text_line(hdc, cpu_card_rect.left + 14, cpu_card_rect.top + 32, &cpu_temp_str, palette.cpu);
+    draw_text_line(hdc, cpu_card_rect.left + 14, cpu_card_rect.top + temp_rel_y, &cpu_temp_str, palette.cpu);
 
     // Dòng phụ: "Công suất: XX.X W | Xung nhịp: X.XX GHz"
     let _ = SelectObject(hdc, font_small);
@@ -810,12 +863,9 @@ unsafe fn paint_dashboard(
     } else {
         format!("Công suất: {:.1}W | {:.2}GHz", cpu_pwr, cpu_ghz)
     };
-    let cpu_card_h = cpu_card_rect.bottom - cpu_card_rect.top;
-    let metric_rel_y = (cpu_card_h * 50 / 100).clamp(68, 100);
     draw_text_line(hdc, cpu_card_rect.left + 14, cpu_card_rect.top + metric_rel_y, &cpu_metric_str, palette.text_sec);
 
-    // Thanh Bar quạt CPU (Tính toán vị trí tương đối theo chiều cao card)
-    let track_rel_y = (cpu_card_h * 64 / 100).max(88);
+    // Thanh Bar quạt CPU
     let cpu_track_rect = RECT {
         left: cpu_card_rect.left + 14,
         top: cpu_card_rect.top + track_rel_y,
@@ -845,15 +895,15 @@ unsafe fn paint_dashboard(
     } else {
         format!("Quạt: {}%", snapshot.cpu_speed)
     };
-    draw_text_line(hdc, cpu_card_rect.left + 14, cpu_card_rect.top + track_rel_y + 16, &cpu_info, palette.text_sec);
+    draw_text_line(hdc, cpu_card_rect.left + 14, cpu_card_rect.top + fan_info_rel_y, &cpu_info, palette.text_sec);
 
-    // Nội dung GPU Card
+    // --- Nội dung GPU Card ---
     let _ = SelectObject(hdc, font_card_header);
-    draw_text_line(hdc, gpu_card_rect.left + 14, gpu_card_rect.top + 12, "GPU TELEMETRY", palette.gpu);
+    draw_text_line(hdc, gpu_card_rect.left + 14, gpu_card_rect.top + header_rel_y, "GPU TELEMETRY", palette.gpu);
 
     let _ = SelectObject(hdc, font_temp);
     let gpu_temp_str = format!("{}°C", snapshot.gpu_temp);
-    draw_text_line(hdc, gpu_card_rect.left + 14, gpu_card_rect.top + 32, &gpu_temp_str, palette.gpu);
+    draw_text_line(hdc, gpu_card_rect.left + 14, gpu_card_rect.top + temp_rel_y, &gpu_temp_str, palette.gpu);
 
     // Dòng phụ: "Công suất: XX.X W | Xung nhịp: X.XX GHz"
     let _ = SelectObject(hdc, font_small);
@@ -865,17 +915,14 @@ unsafe fn paint_dashboard(
     } else {
         format!("Công suất: {:.1}W | {:.2}GHz", gpu_pwr, gpu_ghz)
     };
-    let gpu_card_h = gpu_card_rect.bottom - gpu_card_rect.top;
-    let gpu_metric_rel_y = (gpu_card_h * 50 / 100).clamp(68, 100);
-    draw_text_line(hdc, gpu_card_rect.left + 14, gpu_card_rect.top + gpu_metric_rel_y, &gpu_metric_str, palette.text_sec);
+    draw_text_line(hdc, gpu_card_rect.left + 14, gpu_card_rect.top + metric_rel_y, &gpu_metric_str, palette.text_sec);
 
     // Thanh Bar quạt GPU
-    let gpu_track_rel_y = (gpu_card_h * 64 / 100).max(88);
     let gpu_track_rect = RECT {
         left: gpu_card_rect.left + 14,
-        top: gpu_card_rect.top + gpu_track_rel_y,
+        top: gpu_card_rect.top + track_rel_y,
         right: gpu_card_rect.right - 14,
-        bottom: gpu_card_rect.top + gpu_track_rel_y + 10,
+        bottom: gpu_card_rect.top + track_rel_y + 10,
     };
     FillRect(hdc, &gpu_track_rect, track_brush);
     let _ = DeleteObject(track_brush);
@@ -900,7 +947,7 @@ unsafe fn paint_dashboard(
     } else {
         format!("Quạt: {}%", snapshot.gpu_speed)
     };
-    draw_text_line(hdc, gpu_card_rect.left + 14, gpu_card_rect.top + gpu_track_rel_y + 16, &gpu_info, palette.text_sec);
+    draw_text_line(hdc, gpu_card_rect.left + 14, gpu_card_rect.top + fan_info_rel_y, &gpu_info, palette.text_sec);
 
     // 4. Panel Khóa nhiệt độ CPU (Smooth EPP) từ Layout động
     let epp_panel_rect = layout.epp_panel_rect;
@@ -925,7 +972,7 @@ unsafe fn paint_dashboard(
     let _ = DeleteObject(epp_pen);
 
     let epp_h = epp_panel_rect.bottom - epp_panel_rect.top;
-    let epp_text_y = epp_panel_rect.top + (epp_h - 16) / 2;
+    let epp_text_y = epp_panel_rect.top + (epp_h - 18) / 2;
     let _ = SelectObject(hdc, font_body_bold);
     draw_text_line(
         hdc,
@@ -987,7 +1034,7 @@ unsafe extern "system" fn dashboard_wndproc(
                         state.hovered_btn,
                         state.pressed_btn,
                     );
-                    paint_dashboard(hdc_mem, width, height, state, &layout, &snapshot);
+                    paint_dashboard(hwnd, hdc_mem, width, height, state, &layout, &snapshot);
                 }
 
                 let _ = BitBlt(hdc_screen, 0, 0, width, height, hdc_mem, 0, 0, SRCCOPY);
@@ -1127,9 +1174,33 @@ unsafe extern "system" fn dashboard_wndproc(
         WM_GETMINMAXINFO => {
             let p_mmi = lparam.0 as *mut MINMAXINFO;
             if let Some(mmi) = p_mmi.as_mut() {
-                mmi.ptMinTrackSize.x = 480;
-                mmi.ptMinTrackSize.y = 420;
+                let win_dpi = GetDpiForWindow(hwnd);
+                let dpi = if win_dpi == 0 {
+                    let s = GetDpiForSystem();
+                    if s == 0 { 96 } else { s as i32 }
+                } else {
+                    win_dpi as i32
+                };
+                mmi.ptMinTrackSize.x = MulDiv(520, dpi, 96);
+                mmi.ptMinTrackSize.y = MulDiv(450, dpi, 96);
             }
+            LRESULT(0)
+        }
+        WM_DPICHANGED => {
+            let suggested_rect = lparam.0 as *const RECT;
+            if !suggested_rect.is_null() {
+                let r = *suggested_rect;
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND::default(),
+                    r.left,
+                    r.top,
+                    r.right - r.left,
+                    r.bottom - r.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            let _ = InvalidateRect(hwnd, None, false);
             LRESULT(0)
         }
         WM_SIZE => {
@@ -1212,8 +1283,8 @@ mod tests {
     #[test]
     fn test_rgb_macro() {
         assert_eq!(rgb(18, 20, 23), COLORREF(0x00171412));
-        assert_eq!(rgb(0, 229, 255), COLORREF(0x00FFE500));
-        assert_eq!(rgb(255, 145, 0), COLORREF(0x000091FF));
+        assert_eq!(rgb(0, 240, 255), COLORREF(0x00FFF000));
+        assert_eq!(rgb(255, 167, 38), COLORREF(0x0026A7FF));
         assert_eq!(rgb(255, 59, 48), COLORREF(0x00303BFF));
     }
 
@@ -1221,8 +1292,10 @@ mod tests {
     fn test_theme_palettes() {
         let dark = AppTheme::Dark.palette();
         assert_eq!(dark.bg, rgb(18, 20, 23));
-        assert_eq!(dark.cpu, rgb(0, 229, 255));
-        assert_eq!(dark.gpu, rgb(255, 145, 0));
+        assert_eq!(dark.cpu, rgb(0, 240, 255));
+        assert_eq!(dark.gpu, rgb(255, 167, 38));
+        assert_eq!(dark.text, rgb(248, 250, 252));
+        assert_eq!(dark.text_sec, rgb(208, 217, 230));
 
         let light = AppTheme::Light.palette();
         assert_eq!(light.bg, rgb(244, 246, 249));
@@ -1365,8 +1438,8 @@ mod tests {
             reload_flash_ticks: 0,
         };
 
-        // Kiểm tra 3 kích thước: nhỏ nhất (480x420), chuẩn (540x450), và mở rộng lớn (1000x800)
-        let sizes = [(480, 420), (540, 450), (1000, 800)];
+        // Kiểm tra 4 kích thước: nhỏ nhất (480x420), cũ (540x450), chuẩn mới (600x500), và mở rộng lớn (1000x800)
+        let sizes = [(480, 420), (540, 450), (600, 500), (1000, 800)];
 
         for &(w, h) in &sizes {
             let layout = compute_dashboard_layout(
@@ -1405,6 +1478,42 @@ mod tests {
                 assert!(btn.rect.left >= 0 && btn.rect.right <= w, "Nút {:?} vượt biên ngang", btn.id);
                 assert!(btn.rect.top >= 0 && btn.rect.bottom <= h, "Nút {:?} vượt biên dọc", btn.id);
             }
+        }
+    }
+
+    #[test]
+    fn test_dashboard_window_creation() {
+        let (_sender, _receiver) = std::sync::mpsc::channel::<crate::tray::TrayCommand>();
+        let _state = Arc::new(crate::tray::TrayState::new());
+        let _telemetry = Arc::new(Mutex::new(TelemetryHistory::new()));
+        
+        unsafe {
+            let hinstance = GetModuleHandleW(PCWSTR::null()).unwrap();
+            let class_name = w!("PredatorDashboardWndClassTest");
+            let wnd_class = WNDCLASSW {
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(dashboard_wndproc),
+                hInstance: hinstance.into(),
+                hCursor: LoadCursorW(None, IDC_ARROW).unwrap(),
+                lpszClassName: class_name,
+                ..Default::default()
+            };
+            let _ = RegisterClassW(&wnd_class);
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                class_name,
+                w!("Test Dashboard"),
+                WS_OVERLAPPEDWINDOW,
+                100, 100, 600, 500,
+                HWND::default(),
+                HMENU::default(),
+                hinstance,
+                None,
+            );
+            assert!(hwnd.is_ok(), "CreateWindowExW must succeed: {:?}", hwnd.err());
+            let h = hwnd.unwrap();
+            assert!(!h.0.is_null());
+            let _ = DestroyWindow(h);
         }
     }
 }
