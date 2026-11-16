@@ -32,7 +32,7 @@ use predator_fan_ctl::fan_backend::{
 };
 use predator_fan_ctl::governor::ThermalGovernor;
 use predator_fan_ctl::scm::ServiceGuard;
-use predator_fan_ctl::sensor::TemperatureReader;
+use predator_fan_ctl::sensor::SystemTelemetryReader;
 use predator_fan_ctl::tray::{FanProfile, TrayCommand, TrayManager};
 
 /// Cờ báo hiệu yêu cầu dừng toàn hệ thống
@@ -69,7 +69,7 @@ impl FanController for FallbackBackend {
 /// Handler xử lý tín hiệu ngắt Console (Ctrl+C, Ctrl+Break, Đóng cửa sổ CMD)
 unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> BOOL {
     match ctrl_type {
-        0 /* CTRL_C_EVENT */ | 1 /* CTRL_BREAK_EVENT */ | 2 /* CTRL_CLOSE_EVENT */ => {
+        0..=2 /* CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT */ => {
             println!("\n[SHUTDOWN] Received console interrupt signal ({ctrl_type}). Triggering graceful shutdown...");
             GLOBAL_RUNNING.store(false, Ordering::SeqCst);
             let raw_hwnd = GLOBAL_TRAY_HWND.load(Ordering::Relaxed);
@@ -289,19 +289,37 @@ fn main() {
         println!("[CONTROLLER] Active Backend: {}", backend.name());
         backend.set_manual_mode();
 
-        // Khởi tạo Trình đọc nhiệt độ siêu nhẹ (NVML FFI cho GPU & ACPI cho CPU)
-        let mut temp_reader = TemperatureReader::new();
-        let (init_cpu_t, init_gpu_t) = temp_reader.poll();
-        println!("[SENSOR] Initial telemetry - CPU: {}°C, GPU: {}°C (NVML GPU sensor active: {})",
-            init_cpu_t, init_gpu_t, temp_reader.has_gpu_sensor());
+        // Khởi tạo Trình đọc telemetry toàn diện (NVML FFI cho GPU, ACPI cho CPU Temp, PowrProf cho CPU Clock, PDH cho CPU Power)
+        let mut telemetry_reader = SystemTelemetryReader::new();
+        let (init_cpu_t, init_gpu_t, init_cpu_power, init_gpu_power, init_cpu_mhz, init_gpu_mhz) = telemetry_reader.poll();
+        println!("[SENSOR] Initial telemetry - CPU: {}°C ({:.1}W, {}MHz), GPU: {}°C ({:.1}W, {}MHz) (NVML GPU sensor active: {})",
+            init_cpu_t, init_cpu_power as f32 / 10.0, init_cpu_mhz,
+            init_gpu_t, init_gpu_power as f32 / 10.0, init_gpu_mhz,
+            telemetry_reader.has_gpu_sensor());
 
         let mut last_cpu_speed = evaluate_curve(&worker_config.cpu_curve, init_cpu_t);
         let mut last_gpu_speed = evaluate_curve(&worker_config.gpu_curve, init_gpu_t);
         backend.set_speeds(last_cpu_speed, last_gpu_speed);
         let (init_cpu_rpm, init_gpu_rpm) = backend.read_fan_rpms().unwrap_or((0, 0));
-        worker_tray_handle.update_status(init_cpu_t, last_cpu_speed, init_gpu_t, last_gpu_speed, init_cpu_rpm, init_gpu_rpm);
+        worker_tray_handle.update_full_status(
+            init_cpu_t, last_cpu_speed, init_gpu_t, last_gpu_speed, init_cpu_rpm, init_gpu_rpm,
+            init_cpu_power, init_gpu_power, init_cpu_mhz, init_gpu_mhz,
+        );
+        let init_tip = format!(
+            "CPU: {}°C {:.1}W {:.2}GHz | GPU: {}°C {:.1}W {:.2}GHz",
+            init_cpu_t,
+            init_cpu_power as f32 / 10.0,
+            init_cpu_mhz as f32 / 1000.0,
+            init_gpu_t,
+            init_gpu_power as f32 / 10.0,
+            init_gpu_mhz as f32 / 1000.0,
+        );
+        worker_tray_handle.update_tooltip(&init_tip);
         if let Ok(mut hist) = worker_telemetry.try_lock() {
-            hist.push(init_cpu_t as u8, init_gpu_t as u8, last_cpu_speed, last_gpu_speed);
+            hist.push(
+                init_cpu_t as u8, init_gpu_t as u8, last_cpu_speed, last_gpu_speed,
+                init_cpu_power, init_gpu_power, init_cpu_mhz, init_gpu_mhz,
+            );
         }
 
         // Khởi tạo Smooth EPP Thermal Governor (Intel Speed Shift - Zero Stuttering)
@@ -397,8 +415,8 @@ fn main() {
                 break;
             }
 
-            // Đọc nhiệt độ cảm biến
-            let (cpu_temp, gpu_temp) = temp_reader.poll();
+            // Đọc toàn bộ thông số cảm biến thời gian thực
+            let (cpu_temp, gpu_temp, cpu_power, gpu_power, cpu_mhz, gpu_mhz) = telemetry_reader.poll();
 
             // Tính toán tốc độ quạt mục tiêu dựa theo Profile
             let active_profile = worker_tray_handle.get_profile();
@@ -436,39 +454,30 @@ fn main() {
             // Đọc RPM thời gian thực từ cảm biến phần cứng
             let (cpu_rpm, gpu_rpm) = backend.read_fan_rpms().unwrap_or((0, 0));
 
-            // Cập nhật trạng thái System Tray
-            worker_tray_handle.update_status(cpu_temp, target_cpu_speed, gpu_temp, target_gpu_speed, cpu_rpm, gpu_rpm);
+            // Cập nhật trạng thái System Tray (bao gồm cả công suất và xung nhịp)
+            worker_tray_handle.update_full_status(
+                cpu_temp, target_cpu_speed, gpu_temp, target_gpu_speed, cpu_rpm, gpu_rpm,
+                cpu_power, gpu_power, cpu_mhz, gpu_mhz,
+            );
 
             // Cập nhật bộ đệm lịch sử Telemetry (Zero-Allocation micro-lock)
             if let Ok(mut hist) = worker_telemetry.try_lock() {
-                hist.push(cpu_temp as u8, gpu_temp as u8, target_cpu_speed, target_gpu_speed);
+                hist.push(
+                    cpu_temp as u8, gpu_temp as u8, target_cpu_speed, target_gpu_speed,
+                    cpu_power, gpu_power, cpu_mhz, gpu_mhz,
+                );
             }
 
-            let profile_str = match active_profile {
-                FanProfile::ActiveCurve => "Active Curve",
-                FanProfile::Turbo => "Turbo",
-                FanProfile::Silent => "Silent",
-            };
-
-            let gov_str = if governor.config.enabled {
-                if current_epp == 0 {
-                    format!("[Thermal Target: {}°C | EPP: 0 (Boost)]", governor.config.target_temp)
-                } else {
-                    format!("[Thermal Target: {}°C | EPP: {}]", governor.config.target_temp, current_epp)
-                }
-            } else {
-                "[Thermal Target: OFF]".to_string()
-            };
-
-            let tip = if cpu_rpm > 0 || gpu_rpm > 0 {
-                format!(
-                    "Acer Predator Fan [{profile_str}]\nCPU: {cpu_temp}°C ({cpu_rpm} RPM - {target_cpu_speed}%)\nGPU: {gpu_temp}°C ({gpu_rpm} RPM - {target_gpu_speed}%)\n{gov_str}"
-                )
-            } else {
-                format!(
-                    "Acer Predator Fan [{profile_str}]\nCPU: {cpu_temp}°C ({target_cpu_speed}%)\nGPU: {gpu_temp}°C ({target_gpu_speed}%)\n{gov_str}"
-                )
-            };
+            // Cập nhật tooltip khay hệ thống hiển thị: "CPU: XX°C XX.XW X.XXGHz | GPU: XX°C XX.XW X.XXGHz"
+            let tip = format!(
+                "CPU: {}°C {:.1}W {:.2}GHz | GPU: {}°C {:.1}W {:.2}GHz",
+                cpu_temp,
+                cpu_power as f32 / 10.0,
+                cpu_mhz as f32 / 1000.0,
+                gpu_temp,
+                gpu_power as f32 / 10.0,
+                gpu_mhz as f32 / 1000.0,
+            );
             worker_tray_handle.update_tooltip(&tip);
 
             // Ngủ theo khoảng thời gian cấu hình (chia nhỏ 50ms để đáp ứng lệnh thoát tức thì)

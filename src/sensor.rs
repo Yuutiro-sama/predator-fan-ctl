@@ -1,10 +1,14 @@
-//! Module Đọc Nhiệt độ CPU và GPU Siêu nhẹ (Zero-Allocation Polling Loop).
+//! Module Đọc Cảm biến Toàn diện (Zero-Allocation Hardware Telemetry Polling Loop).
 //!
 //! Thiết kế chuyên biệt để duy trì mức tiêu thụ CPU < 0.05%:
 //! - GPU: Nạp động `nvml.dll` qua Win32 FFI một lần duy nhất lúc khởi động.
-//!   Mỗi chu kỳ chỉ gọi trực tiếp hàm con trỏ C `nvmlDeviceGetTemperature` (< 5 micro-giây, 0 allocation).
-//! - CPU: Truy vấn ACPI ThermalZone (`root\WMI` -> `MSAcpi_ThermalZoneTemperature.CurrentTemperature`),
-//!   chuyển đổi từ tenths of Kelvin sang độ Celsius chuẩn xác, kèm cơ chế fallback thông minh.
+//!   Mỗi chu kỳ chỉ gọi trực tiếp hàm con trỏ C `nvmlDeviceGetTemperature`, `nvmlDeviceGetPowerUsage`
+//!   và `nvmlDeviceGetClockInfo` (< 5 micro-giây, 0 allocation, an toàn với NVIDIA Optimus D3cold).
+//! - CPU Xung nhịp: `CallNtPowerInformation` (PowrProf Win32 FFI) đọc trực tiếp cấu trúc năng lượng
+//!   của toàn bộ các luồng logic (vd 20 luồng i7-13700HX) và trích xuất xung nhịp boost đỉnh max(CurrentMhz).
+//! - CPU Công suất: Windows PDH English Counter `\Energy Meter(RAPL_Package0_PKG)\Power` đọc trực tiếp
+//!   công suất thực tế Intel RAPL Package 0 đơn vị deciwatt (0.1 W).
+//! - CPU Nhiệt độ: ACPI ThermalZone (`root\WMI` -> `MSAcpi_ThermalZoneTemperature.CurrentTemperature`).
 
 use std::ffi::c_void;
 use serde::Deserialize;
@@ -22,15 +26,22 @@ type NvmlDeviceGetHandleByIndexFn =
     unsafe extern "system" fn(u32, *mut *mut c_void) -> i32;
 type NvmlDeviceGetTemperatureFn =
     unsafe extern "system" fn(*mut c_void, u32, *mut u32) -> i32;
+type NvmlDeviceGetPowerUsageFn =
+    unsafe extern "system" fn(*mut c_void, *mut u32) -> i32;
+type NvmlDeviceGetClockInfoFn =
+    unsafe extern "system" fn(*mut c_void, u32, *mut u32) -> i32;
 
 const NVML_SUCCESS: i32 = 0;
 const NVML_TEMPERATURE_GPU: u32 = 0;
+const NVML_CLOCK_GRAPHICS: u32 = 0;
 
-/// Bộ đọc nhiệt độ GPU NVIDIA sử dụng dynamic FFI tới `nvml.dll`.
+/// Bộ đọc cảm biến GPU NVIDIA sử dụng dynamic FFI tới `nvml.dll`.
 pub struct NvmlGpuSensor {
     module: HMODULE,
     shutdown: NvmlShutdownFn,
     get_temp: NvmlDeviceGetTemperatureFn,
+    get_power: Option<NvmlDeviceGetPowerUsageFn>,
+    get_clock: Option<NvmlDeviceGetClockInfoFn>,
     device: *mut c_void,
 }
 
@@ -61,6 +72,8 @@ impl NvmlGpuSensor {
             let shutdown_name = b"nvmlShutdown\0";
             let handle_name = b"nvmlDeviceGetHandleByIndex_v2\0";
             let temp_name = b"nvmlDeviceGetTemperature\0";
+            let power_name = b"nvmlDeviceGetPowerUsage\0";
+            let clock_name = b"nvmlDeviceGetClockInfo\0";
 
             let p_init = GetProcAddress(module, windows::core::PCSTR(init_name.as_ptr()))?;
             let p_shutdown = GetProcAddress(module, windows::core::PCSTR(shutdown_name.as_ptr()))?;
@@ -71,6 +84,14 @@ impl NvmlGpuSensor {
             let shutdown_fn: NvmlShutdownFn = std::mem::transmute(p_shutdown);
             let handle_fn: NvmlDeviceGetHandleByIndexFn = std::mem::transmute(p_handle);
             let get_temp_fn: NvmlDeviceGetTemperatureFn = std::mem::transmute(p_temp);
+
+            let get_power: Option<NvmlDeviceGetPowerUsageFn> =
+                GetProcAddress(module, windows::core::PCSTR(power_name.as_ptr()))
+                    .map(|p| std::mem::transmute(p));
+
+            let get_clock: Option<NvmlDeviceGetClockInfoFn> =
+                GetProcAddress(module, windows::core::PCSTR(clock_name.as_ptr()))
+                    .map(|p| std::mem::transmute(p));
 
             // Khởi tạo thư viện NVML
             if init_fn() != NVML_SUCCESS {
@@ -90,6 +111,8 @@ impl NvmlGpuSensor {
                 module,
                 shutdown: shutdown_fn,
                 get_temp: get_temp_fn,
+                get_power,
+                get_clock,
                 device,
             })
         }
@@ -108,6 +131,36 @@ impl NvmlGpuSensor {
             }
         }
     }
+
+    /// Đọc công suất (deciwatt: 0.1 W) và xung nhịp GPU (MHz).
+    ///
+    /// An toàn tuyệt đối với NVIDIA Optimus D3cold:
+    /// Khi dGPU ở chế độ ngủ tiết kiệm điện hoặc NVML trả về mã lỗi (!= 0),
+    /// hàm trả về (0, 0) mà không gây panic, không ghi log spam và không đánh thức dGPU.
+    #[inline]
+    pub fn read_power_and_clock(&self) -> (u16, u16) {
+        let mut power_dw: u16 = 0;
+        let mut clock_mhz: u16 = 0;
+
+        unsafe {
+            if let Some(get_power) = self.get_power {
+                let mut power_mw: u32 = 0;
+                if get_power(self.device, &mut power_mw) == NVML_SUCCESS {
+                    // Quy đổi mW sang deciwatts (0.1 W): (power_mw + 50) / 100
+                    power_dw = ((power_mw + 50) / 100).min(u16::MAX as u32) as u16;
+                }
+            }
+
+            if let Some(get_clock) = self.get_clock {
+                let mut mhz: u32 = 0;
+                if get_clock(self.device, NVML_CLOCK_GRAPHICS, &mut mhz) == NVML_SUCCESS {
+                    clock_mhz = mhz.min(u16::MAX as u32) as u16;
+                }
+            }
+        }
+
+        (power_dw, clock_mhz)
+    }
 }
 
 impl Drop for NvmlGpuSensor {
@@ -120,7 +173,272 @@ impl Drop for NvmlGpuSensor {
 }
 
 // ============================================================================
-// 2. CPU SENSOR (ACPI ThermalZone via WMI)
+// 2. CPU CLOCK SENSOR (PowrProf Win32 FFI - CallNtPowerInformation)
+// ============================================================================
+
+/// Cấu trúc thông tin năng lượng và xung nhịp từng luồng CPU từ powrprof.dll
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(non_snake_case)]
+pub struct PROCESSOR_POWER_INFORMATION {
+    pub Number: u32,
+    pub MaxMhz: u32,
+    pub CurrentMhz: u32,
+    pub MhzLimit: u32,
+    pub MaxIdleState: u32,
+    pub CurrentIdleState: u32,
+}
+
+type CallNtPowerInformationFn = unsafe extern "system" fn(
+    i32,           // InformationLevel: 11 = ProcessorInformation
+    *const c_void, // lpInputBuffer
+    u32,           // nInputBufferSize
+    *mut c_void,   // lpOutputBuffer
+    u32,           // nOutputBufferSize
+) -> i32;
+
+#[repr(C)]
+struct SYSTEM_INFO {
+    w_processor_architecture: u16,
+    w_reserved: u16,
+    dw_page_size: u32,
+    lp_minimum_application_address: *mut c_void,
+    lp_maximum_application_address: *mut c_void,
+    dw_active_processor_mask: usize,
+    dw_number_of_processors: u32,
+    dw_processor_type: u32,
+    dw_allocation_granularity: u32,
+    w_processor_level: u16,
+    w_processor_revision: u16,
+}
+
+extern "system" {
+    fn GetSystemInfo(lpSystemInfo: *mut SYSTEM_INFO);
+}
+
+/// Bộ đọc xung nhịp CPU thông qua `CallNtPowerInformation` (PowrProf.dll).
+/// Trích xuất xung nhịp boost đỉnh max(CurrentMhz) của toàn bộ các luồng logic.
+pub struct CpuClockSensor {
+    module: Option<HMODULE>,
+    call_nt_power_info: Option<CallNtPowerInformationFn>,
+    buffer: Vec<PROCESSOR_POWER_INFORMATION>,
+    last_max_mhz: u16,
+}
+
+unsafe impl Send for CpuClockSensor {}
+unsafe impl Sync for CpuClockSensor {}
+
+impl CpuClockSensor {
+    /// Khởi tạo sensor xung nhịp CPU, xác định số luồng và cấp phát buffer cố định một lần duy nhất.
+    pub fn new() -> Self {
+        let mut sys_info = unsafe { std::mem::zeroed::<SYSTEM_INFO>() };
+        unsafe { GetSystemInfo(&mut sys_info) };
+        let num_procs = if sys_info.dw_number_of_processors > 0 {
+            sys_info.dw_number_of_processors as usize
+        } else {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(20)
+        };
+
+        let buffer = vec![PROCESSOR_POWER_INFORMATION::default(); num_procs];
+
+        let dll_wide: Vec<u16> = "powrprof.dll\0".encode_utf16().collect();
+        let module = unsafe { LoadLibraryW(PCWSTR(dll_wide.as_ptr())).ok() };
+
+        let call_nt_power_info: Option<CallNtPowerInformationFn> = module.and_then(|m| unsafe {
+            GetProcAddress(m, windows::core::PCSTR(b"CallNtPowerInformation\0".as_ptr()))
+                .map(|p| std::mem::transmute(p))
+        });
+
+        let mut sensor = Self {
+            module,
+            call_nt_power_info,
+            buffer,
+            last_max_mhz: 2500,
+        };
+
+        // Lấy mẫu mồi lần đầu
+        let _ = sensor.sample_max_mhz();
+        sensor
+    }
+
+    /// Lấy mẫu xung nhịp tức thời và trả về xung nhịp lớn nhất giữa các luồng (MHz).
+    pub fn sample_max_mhz(&mut self) -> u16 {
+        if let Some(call_fn) = self.call_nt_power_info {
+            let out_size =
+                (self.buffer.len() * std::mem::size_of::<PROCESSOR_POWER_INFORMATION>()) as u32;
+            let status = unsafe {
+                call_fn(
+                    11, // ProcessorInformation
+                    std::ptr::null(),
+                    0,
+                    self.buffer.as_mut_ptr() as *mut c_void,
+                    out_size,
+                )
+            };
+
+            if status == 0 {
+                let max_mhz = self.buffer.iter().map(|p| p.CurrentMhz).max().unwrap_or(0);
+                if max_mhz > 0 {
+                    self.last_max_mhz = max_mhz.min(u16::MAX as u32) as u16;
+                }
+            }
+        }
+
+        self.last_max_mhz
+    }
+
+    /// Xung nhịp CPU cao nhất đã đo gần nhất (MHz).
+    #[inline]
+    pub fn last_max_mhz(&self) -> u16 {
+        self.last_max_mhz
+    }
+}
+
+impl Drop for CpuClockSensor {
+    fn drop(&mut self) {
+        if let Some(m) = self.module {
+            unsafe {
+                let _ = FreeLibrary(m);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 3. CPU POWER SENSOR (Windows PDH - RAPL Energy Meter)
+// ============================================================================
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PdhFmtCounterValueDouble {
+    pub c_status: u32,
+    pub _padding: u32,
+    pub double_value: f64,
+}
+
+type PdhOpenQueryWFn = unsafe extern "system" fn(PCWSTR, usize, *mut usize) -> i32;
+type PdhAddEnglishCounterWFn = unsafe extern "system" fn(usize, PCWSTR, usize, *mut usize) -> i32;
+type PdhCollectQueryDataFn = unsafe extern "system" fn(usize) -> i32;
+type PdhGetFormattedCounterValueFn =
+    unsafe extern "system" fn(usize, u32, *mut u32, *mut PdhFmtCounterValueDouble) -> i32;
+type PdhCloseQueryFn = unsafe extern "system" fn(usize) -> i32;
+
+const PDH_FMT_DOUBLE: u32 = 0x00000200;
+
+/// Bộ đọc công suất CPU sử dụng Performance Data Helper (PDH) Counter RAPL Package.
+pub struct CpuPowerSensor {
+    module: HMODULE,
+    query: usize,
+    counter: usize,
+    collect_fn: PdhCollectQueryDataFn,
+    get_formatted_fn: PdhGetFormattedCounterValueFn,
+    close_fn: PdhCloseQueryFn,
+    last_power_dw: u16,
+}
+
+unsafe impl Send for CpuPowerSensor {}
+unsafe impl Sync for CpuPowerSensor {}
+
+impl CpuPowerSensor {
+    /// Khởi tạo PDH query với counter `\Energy Meter(RAPL_Package0_PKG)\Power`.
+    /// Trả về `None` nếu PDH hoặc counter RAPL không khả dụng.
+    pub fn new() -> Option<Self> {
+        unsafe {
+            let dll_wide: Vec<u16> = "pdh.dll\0".encode_utf16().collect();
+            let module = LoadLibraryW(PCWSTR(dll_wide.as_ptr())).ok()?;
+
+            let p_open = GetProcAddress(module, windows::core::PCSTR(b"PdhOpenQueryW\0".as_ptr()))?;
+            let p_add =
+                GetProcAddress(module, windows::core::PCSTR(b"PdhAddEnglishCounterW\0".as_ptr()))?;
+            let p_collect =
+                GetProcAddress(module, windows::core::PCSTR(b"PdhCollectQueryData\0".as_ptr()))?;
+            let p_fmt = GetProcAddress(
+                module,
+                windows::core::PCSTR(b"PdhGetFormattedCounterValue\0".as_ptr()),
+            )?;
+            let p_close =
+                GetProcAddress(module, windows::core::PCSTR(b"PdhCloseQuery\0".as_ptr()))?;
+
+            let open_query: PdhOpenQueryWFn = std::mem::transmute(p_open);
+            let add_counter: PdhAddEnglishCounterWFn = std::mem::transmute(p_add);
+            let collect_fn: PdhCollectQueryDataFn = std::mem::transmute(p_collect);
+            let get_formatted_fn: PdhGetFormattedCounterValueFn = std::mem::transmute(p_fmt);
+            let close_fn: PdhCloseQueryFn = std::mem::transmute(p_close);
+
+            let mut query: usize = 0;
+            if open_query(PCWSTR::null(), 0, &mut query) != 0 || query == 0 {
+                let _ = FreeLibrary(module);
+                return None;
+            }
+
+            let counter_path: Vec<u16> = "\\Energy Meter(RAPL_Package0_PKG)\\Power\0"
+                .encode_utf16()
+                .collect();
+            let mut counter: usize = 0;
+            if add_counter(query, PCWSTR(counter_path.as_ptr()), 0, &mut counter) != 0 || counter == 0 {
+                let _ = close_fn(query);
+                let _ = FreeLibrary(module);
+                return None;
+            }
+
+            // Gọi mồi lần đầu để PDH thiết lập mốc đo năng lượng baseline
+            let _ = collect_fn(query);
+
+            Some(Self {
+                module,
+                query,
+                counter,
+                collect_fn,
+                get_formatted_fn,
+                close_fn,
+                last_power_dw: 0,
+            })
+        }
+    }
+
+    /// Lấy mẫu công suất tiêu thụ CPU hiện tại theo đơn vị deciwatt (0.1 W).
+    /// Ví dụ: 42.8 W trả về 428 deciwatt.
+    pub fn sample_deciwatts(&mut self) -> u16 {
+        unsafe {
+            if (self.collect_fn)(self.query) == 0 {
+                let mut val = PdhFmtCounterValueDouble::default();
+                if (self.get_formatted_fn)(self.counter, PDH_FMT_DOUBLE, std::ptr::null_mut(), &mut val)
+                    == 0
+                    && val.c_status == 0
+                {
+                    if val.double_value >= 0.0 {
+                        // val.double_value trả về milliwatts (mW).
+                        // Quy đổi mW sang deciwatts (0.1 W): mW / 100
+                        let dw = (val.double_value / 100.0).round();
+                        self.last_power_dw = dw.min(u16::MAX as f64).max(0.0) as u16;
+                    }
+                }
+            }
+        }
+
+        self.last_power_dw
+    }
+
+    /// Công suất CPU gần nhất đo được (deciwatt).
+    #[inline]
+    pub fn last_power_dw(&self) -> u16 {
+        self.last_power_dw
+    }
+}
+
+impl Drop for CpuPowerSensor {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = (self.close_fn)(self.query);
+            let _ = FreeLibrary(self.module);
+        }
+    }
+}
+
+// ============================================================================
+// 4. CPU TEMPERATURE SENSOR (ACPI ThermalZone via WMI)
 // ============================================================================
 
 #[derive(Deserialize, Debug)]
@@ -205,7 +523,7 @@ impl AcpiCpuSensor {
 }
 
 // ============================================================================
-// 3. COMBINED SENSOR MANAGER
+// 5. COMBINED TEMPERATURE READER (Legacy Compatible)
 // ============================================================================
 
 /// Trình quản lý cảm biến nhiệt độ tổng hợp cho CPU và GPU.
@@ -275,6 +593,131 @@ impl TemperatureReader {
     }
 }
 
+// ============================================================================
+// 6. SYSTEM TELEMETRY READER (Full CPU & GPU Metrics Hub)
+// ============================================================================
+
+/// Trình đọc vi sai telemetry toàn diện: Nhiệt độ, Công suất và Xung nhịp CPU & GPU.
+/// Không phân bổ bộ nhớ động trong vòng lặp thu thập 1 Hz.
+pub struct SystemTelemetryReader {
+    gpu: Option<NvmlGpuSensor>,
+    cpu_temp: AcpiCpuSensor,
+    cpu_clock: CpuClockSensor,
+    cpu_power: Option<CpuPowerSensor>,
+    last_cpu_temp: u32,
+    last_gpu_temp: u32,
+    last_cpu_power_dw: u16,
+    last_gpu_power_dw: u16,
+    last_cpu_mhz: u16,
+    last_gpu_mhz: u16,
+}
+
+unsafe impl Send for SystemTelemetryReader {}
+unsafe impl Sync for SystemTelemetryReader {}
+
+impl SystemTelemetryReader {
+    /// Khởi tạo trung tâm đọc telemetry với toàn bộ cảm biến phần cứng sẵn có.
+    pub fn new() -> Self {
+        let gpu = NvmlGpuSensor::new();
+        let cpu_temp = AcpiCpuSensor::new();
+        let cpu_clock = CpuClockSensor::new();
+        let cpu_power = CpuPowerSensor::new();
+
+        let mut reader = Self {
+            gpu,
+            cpu_temp,
+            cpu_clock,
+            cpu_power,
+            last_cpu_temp: 45,
+            last_gpu_temp: 40,
+            last_cpu_power_dw: 0,
+            last_gpu_power_dw: 0,
+            last_cpu_mhz: 2500,
+            last_gpu_mhz: 0,
+        };
+
+        // Đọc mồi lần đầu
+        let _ = reader.poll();
+        reader
+    }
+
+    /// Đọc đồng thời toàn bộ thông số:
+    /// `(cpu_temp: u32, gpu_temp: u32, cpu_power_dw: u16, gpu_power_dw: u16, cpu_mhz: u16, gpu_mhz: u16)`
+    pub fn poll(&mut self) -> (u32, u32, u16, u16, u16, u16) {
+        if let Some(t) = self.cpu_temp.read_temp() {
+            self.last_cpu_temp = t;
+        }
+
+        if let Some(ref gpu) = self.gpu {
+            if let Some(t) = gpu.read_temp() {
+                self.last_gpu_temp = t;
+            }
+            let (g_pwr, g_clk) = gpu.read_power_and_clock();
+            self.last_gpu_power_dw = g_pwr;
+            self.last_gpu_mhz = g_clk;
+        }
+
+        self.last_cpu_mhz = self.cpu_clock.sample_max_mhz();
+
+        if let Some(ref mut pwr) = self.cpu_power {
+            self.last_cpu_power_dw = pwr.sample_deciwatts();
+        }
+
+        (
+            self.last_cpu_temp,
+            self.last_gpu_temp,
+            self.last_cpu_power_dw,
+            self.last_gpu_power_dw,
+            self.last_cpu_mhz,
+            self.last_gpu_mhz,
+        )
+    }
+
+    #[inline]
+    pub fn last_cpu_temp(&self) -> u32 {
+        self.last_cpu_temp
+    }
+
+    #[inline]
+    pub fn last_gpu_temp(&self) -> u32 {
+        self.last_gpu_temp
+    }
+
+    #[inline]
+    pub fn last_cpu_power_dw(&self) -> u16 {
+        self.last_cpu_power_dw
+    }
+
+    #[inline]
+    pub fn last_gpu_power_dw(&self) -> u16 {
+        self.last_gpu_power_dw
+    }
+
+    #[inline]
+    pub fn last_cpu_mhz(&self) -> u16 {
+        self.last_cpu_mhz
+    }
+
+    #[inline]
+    pub fn last_gpu_mhz(&self) -> u16 {
+        self.last_gpu_mhz
+    }
+
+    #[inline]
+    pub fn has_gpu_sensor(&self) -> bool {
+        self.gpu.is_some()
+    }
+
+    #[inline]
+    pub fn has_cpu_power_sensor(&self) -> bool {
+        self.cpu_power.is_some()
+    }
+}
+
+// ============================================================================
+// UNIT TESTS
+// ============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,5 +733,54 @@ mod tests {
         } else {
             println!("No NVML device detected on host.");
         }
+    }
+
+    #[test]
+    fn test_nvml_gpu_power_and_clock() {
+        if let Some(gpu) = NvmlGpuSensor::new() {
+            let (power_dw, clock_mhz) = gpu.read_power_and_clock();
+            println!("GPU Power: {:.1} W, Clock: {} MHz", power_dw as f32 / 10.0, clock_mhz);
+            // Giá trị có thể bằng 0 nếu dGPU đang ở Optimus D3cold, không panic
+            assert!(power_dw < 4000); // < 400 W
+            assert!(clock_mhz < 4000); // < 4000 MHz
+        }
+    }
+
+    #[test]
+    fn test_cpu_clock_sensor() {
+        let mut sensor = CpuClockSensor::new();
+        let max_mhz = sensor.sample_max_mhz();
+        println!("Sampled max CPU CurrentMhz: {}", max_mhz);
+        assert!(max_mhz > 400, "CPU CurrentMhz {} suspiciously low", max_mhz);
+        assert!(max_mhz < 7000, "CPU CurrentMhz {} exceeds realistic limit", max_mhz);
+    }
+
+    #[test]
+    fn test_cpu_power_sensor() {
+        if let Some(mut sensor) = CpuPowerSensor::new() {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let deciwatts = sensor.sample_deciwatts();
+            println!("Sampled CPU Package Power: {:.1} W ({} dW)", deciwatts as f32 / 10.0, deciwatts);
+            assert!(deciwatts < 3000, "CPU power {} dW suspiciously high", deciwatts);
+        } else {
+            println!("PDH RAPL counter not available on host system.");
+        }
+    }
+
+    #[test]
+    fn test_system_telemetry_reader() {
+        let mut reader = SystemTelemetryReader::new();
+        let (cpu_t, gpu_t, cpu_p, gpu_p, cpu_clk, gpu_clk) = reader.poll();
+        println!(
+            "SystemTelemetry: CPU: {}°C, {:.1}W, {}MHz | GPU: {}°C, {:.1}W, {}MHz",
+            cpu_t,
+            cpu_p as f32 / 10.0,
+            cpu_clk,
+            gpu_t,
+            gpu_p as f32 / 10.0,
+            gpu_clk
+        );
+        assert!(cpu_t >= 20 && cpu_t <= 115);
+        assert!(cpu_clk > 400);
     }
 }

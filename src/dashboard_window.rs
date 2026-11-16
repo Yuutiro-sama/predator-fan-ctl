@@ -146,6 +146,10 @@ pub struct DashboardSnapshot {
     pub gpu_speed: u8,
     pub cpu_rpm: u32,
     pub gpu_rpm: u32,
+    pub cpu_power_dw: u16,
+    pub gpu_power_dw: u16,
+    pub cpu_mhz: u16,
+    pub gpu_mhz: u16,
     pub active_profile: FanProfile,
     pub governor_enabled: bool,
     pub governor_target_temp: u32,
@@ -162,6 +166,10 @@ impl Default for DashboardSnapshot {
             gpu_speed: 0,
             cpu_rpm: 0,
             gpu_rpm: 0,
+            cpu_power_dw: 0,
+            gpu_power_dw: 0,
+            cpu_mhz: 0,
+            gpu_mhz: 0,
             active_profile: FanProfile::ActiveCurve,
             governor_enabled: true,
             governor_target_temp: 80,
@@ -174,6 +182,7 @@ impl Default for DashboardSnapshot {
 impl DashboardSnapshot {
     pub fn from_state(state: &TrayState, reload_flash_ticks: u8) -> Self {
         let (cpu_temp, cpu_speed, gpu_temp, gpu_speed, cpu_rpm, gpu_rpm) = state.get_status_rpm();
+        let (cpu_power_dw, gpu_power_dw, cpu_mhz, gpu_mhz) = state.get_metrics();
         let (governor_enabled, governor_target_temp, governor_epp) = state.get_governor_info();
         let active_profile = state.get_profile();
 
@@ -184,6 +193,10 @@ impl DashboardSnapshot {
             gpu_speed,
             cpu_rpm,
             gpu_rpm,
+            cpu_power_dw,
+            gpu_power_dw,
+            cpu_mhz,
+            gpu_mhz,
             active_profile,
             governor_enabled,
             governor_target_temp,
@@ -262,7 +275,7 @@ pub fn compute_dashboard_layout(
 
     // Phân bổ chiều dọc linh hoạt (Responsive Vertical Distribution)
     let available_content = (h - 48 - 16).max(340);
-    let card_h = (available_content * 33 / 100).clamp(130, 240);
+    let card_h = (available_content * 35 / 100).clamp(138, 240);
     let card_bottom = 48 + card_h;
 
     let base_gap = ((available_content - (card_h + 38 + 38 + 78)) / 4).clamp(6, 20);
@@ -729,7 +742,7 @@ unsafe fn paint_dashboard(
     // Khởi tạo các Font cần thiết
     let font_title = create_font(17, FW_BOLD.0 as i32);
     let font_card_header = create_font(14, FW_BOLD.0 as i32);
-    let font_temp = create_font(40, FW_BOLD.0 as i32); // 32pt Segoe UI Bold
+    let font_temp = create_font(36, FW_BOLD.0 as i32); // 27pt Segoe UI Bold
     let font_small = create_font(13, FW_NORMAL.0 as i32);
     let font_body = create_font(14, FW_NORMAL.0 as i32);
     let font_body_bold = create_font(14, FW_SEMIBOLD.0 as i32);
@@ -785,16 +798,29 @@ unsafe fn paint_dashboard(
 
     let _ = SelectObject(hdc, font_temp);
     let cpu_temp_str = format!("{}°C", snapshot.cpu_temp);
-    draw_text_line(hdc, cpu_card_rect.left + 14, cpu_card_rect.top + 34, &cpu_temp_str, palette.cpu);
+    draw_text_line(hdc, cpu_card_rect.left + 14, cpu_card_rect.top + 32, &cpu_temp_str, palette.cpu);
+
+    // Dòng phụ: "Công suất: XX.X W | Xung nhịp: X.XX GHz"
+    let _ = SelectObject(hdc, font_small);
+    let cpu_pwr = snapshot.cpu_power_dw as f32 / 10.0;
+    let cpu_ghz = snapshot.cpu_mhz as f32 / 1000.0;
+    let cpu_card_w = cpu_card_rect.right - cpu_card_rect.left;
+    let cpu_metric_str = if cpu_card_w >= 235 {
+        format!("Công suất: {:.1} W | Xung nhịp: {:.2} GHz", cpu_pwr, cpu_ghz)
+    } else {
+        format!("Công suất: {:.1}W | {:.2}GHz", cpu_pwr, cpu_ghz)
+    };
+    let cpu_card_h = cpu_card_rect.bottom - cpu_card_rect.top;
+    let metric_rel_y = (cpu_card_h * 50 / 100).clamp(68, 100);
+    draw_text_line(hdc, cpu_card_rect.left + 14, cpu_card_rect.top + metric_rel_y, &cpu_metric_str, palette.text_sec);
 
     // Thanh Bar quạt CPU (Tính toán vị trí tương đối theo chiều cao card)
-    let cpu_card_h = cpu_card_rect.bottom - cpu_card_rect.top;
-    let track_rel_y = (cpu_card_h * 58 / 100).max(80);
+    let track_rel_y = (cpu_card_h * 64 / 100).max(88);
     let cpu_track_rect = RECT {
         left: cpu_card_rect.left + 14,
         top: cpu_card_rect.top + track_rel_y,
         right: cpu_card_rect.right - 14,
-        bottom: cpu_card_rect.top + track_rel_y + 12,
+        bottom: cpu_card_rect.top + track_rel_y + 10,
     };
     let track_brush = CreateSolidBrush(palette.bar_bg);
     FillRect(hdc, &cpu_track_rect, track_brush);
@@ -819,7 +845,7 @@ unsafe fn paint_dashboard(
     } else {
         format!("Quạt: {}%", snapshot.cpu_speed)
     };
-    draw_text_line(hdc, cpu_card_rect.left + 14, cpu_card_rect.top + track_rel_y + 18, &cpu_info, palette.text_sec);
+    draw_text_line(hdc, cpu_card_rect.left + 14, cpu_card_rect.top + track_rel_y + 16, &cpu_info, palette.text_sec);
 
     // Nội dung GPU Card
     let _ = SelectObject(hdc, font_card_header);
@@ -827,16 +853,29 @@ unsafe fn paint_dashboard(
 
     let _ = SelectObject(hdc, font_temp);
     let gpu_temp_str = format!("{}°C", snapshot.gpu_temp);
-    draw_text_line(hdc, gpu_card_rect.left + 14, gpu_card_rect.top + 34, &gpu_temp_str, palette.gpu);
+    draw_text_line(hdc, gpu_card_rect.left + 14, gpu_card_rect.top + 32, &gpu_temp_str, palette.gpu);
+
+    // Dòng phụ: "Công suất: XX.X W | Xung nhịp: X.XX GHz"
+    let _ = SelectObject(hdc, font_small);
+    let gpu_pwr = snapshot.gpu_power_dw as f32 / 10.0;
+    let gpu_ghz = snapshot.gpu_mhz as f32 / 1000.0;
+    let gpu_card_w = gpu_card_rect.right - gpu_card_rect.left;
+    let gpu_metric_str = if gpu_card_w >= 235 {
+        format!("Công suất: {:.1} W | Xung nhịp: {:.2} GHz", gpu_pwr, gpu_ghz)
+    } else {
+        format!("Công suất: {:.1}W | {:.2}GHz", gpu_pwr, gpu_ghz)
+    };
+    let gpu_card_h = gpu_card_rect.bottom - gpu_card_rect.top;
+    let gpu_metric_rel_y = (gpu_card_h * 50 / 100).clamp(68, 100);
+    draw_text_line(hdc, gpu_card_rect.left + 14, gpu_card_rect.top + gpu_metric_rel_y, &gpu_metric_str, palette.text_sec);
 
     // Thanh Bar quạt GPU
-    let gpu_card_h = gpu_card_rect.bottom - gpu_card_rect.top;
-    let gpu_track_rel_y = (gpu_card_h * 58 / 100).max(80);
+    let gpu_track_rel_y = (gpu_card_h * 64 / 100).max(88);
     let gpu_track_rect = RECT {
         left: gpu_card_rect.left + 14,
         top: gpu_card_rect.top + gpu_track_rel_y,
         right: gpu_card_rect.right - 14,
-        bottom: gpu_card_rect.top + gpu_track_rel_y + 12,
+        bottom: gpu_card_rect.top + gpu_track_rel_y + 10,
     };
     FillRect(hdc, &gpu_track_rect, track_brush);
     let _ = DeleteObject(track_brush);
@@ -861,7 +900,7 @@ unsafe fn paint_dashboard(
     } else {
         format!("Quạt: {}%", snapshot.gpu_speed)
     };
-    draw_text_line(hdc, gpu_card_rect.left + 14, gpu_card_rect.top + gpu_track_rel_y + 18, &gpu_info, palette.text_sec);
+    draw_text_line(hdc, gpu_card_rect.left + 14, gpu_card_rect.top + gpu_track_rel_y + 16, &gpu_info, palette.text_sec);
 
     // 4. Panel Khóa nhiệt độ CPU (Smooth EPP) từ Layout động
     let epp_panel_rect = layout.epp_panel_rect;
@@ -1217,6 +1256,10 @@ mod tests {
             gpu_speed: 40,
             cpu_rpm: 3200,
             gpu_rpm: 3100,
+            cpu_power_dw: 420,
+            gpu_power_dw: 185,
+            cpu_mhz: 3800,
+            gpu_mhz: 2200,
             active_profile: FanProfile::Turbo,
             governor_enabled: true,
             governor_target_temp: 80,
@@ -1259,6 +1302,7 @@ mod tests {
     fn test_dashboard_snapshot_from_state() {
         let state = Arc::new(TrayState::new());
         state.update_status(72, 60, 68, 55, 3600, 3400);
+        state.update_metrics(428, 195, 3820, 2250);
         state.update_governor_status(true, 85, 128);
         state.set_profile(FanProfile::Silent);
 
@@ -1269,11 +1313,36 @@ mod tests {
         assert_eq!(snap.gpu_speed, 55);
         assert_eq!(snap.cpu_rpm, 3600);
         assert_eq!(snap.gpu_rpm, 3400);
+        assert_eq!(snap.cpu_power_dw, 428);
+        assert_eq!(snap.gpu_power_dw, 195);
+        assert_eq!(snap.cpu_mhz, 3820);
+        assert_eq!(snap.gpu_mhz, 2250);
         assert_eq!(snap.active_profile, FanProfile::Silent);
         assert!(snap.governor_enabled);
         assert_eq!(snap.governor_target_temp, 85);
         assert_eq!(snap.governor_epp, 128);
         assert_eq!(snap.reload_flash_ticks, 2);
+    }
+
+    #[test]
+    fn test_dashboard_snapshot_metrics_formatting() {
+        let snap = DashboardSnapshot {
+            cpu_power_dw: 428,
+            gpu_power_dw: 192,
+            cpu_mhz: 3820,
+            gpu_mhz: 2250,
+            ..DashboardSnapshot::default()
+        };
+
+        let cpu_pwr = snap.cpu_power_dw as f32 / 10.0;
+        let cpu_ghz = snap.cpu_mhz as f32 / 1000.0;
+        let str_full = format!("Công suất: {:.1} W | Xung nhịp: {:.2} GHz", cpu_pwr, cpu_ghz);
+        assert_eq!(str_full, "Công suất: 42.8 W | Xung nhịp: 3.82 GHz");
+
+        let gpu_pwr = snap.gpu_power_dw as f32 / 10.0;
+        let gpu_ghz = snap.gpu_mhz as f32 / 1000.0;
+        let gpu_str_full = format!("Công suất: {:.1} W | Xung nhịp: {:.2} GHz", gpu_pwr, gpu_ghz);
+        assert_eq!(gpu_str_full, "Công suất: 19.2 W | Xung nhịp: 2.25 GHz");
     }
 
     #[test]
@@ -1285,6 +1354,10 @@ mod tests {
             gpu_speed: 45,
             cpu_rpm: 3400,
             gpu_rpm: 3200,
+            cpu_power_dw: 450,
+            gpu_power_dw: 200,
+            cpu_mhz: 4000,
+            gpu_mhz: 2300,
             active_profile: FanProfile::ActiveCurve,
             governor_enabled: true,
             governor_target_temp: 85,

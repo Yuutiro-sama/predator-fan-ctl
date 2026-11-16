@@ -1,12 +1,17 @@
-//! Acer Predator Temperature History Chart Window (Pure Win32 GDI Dark Mode)
+//! Acer Predator Temperature, Power & Clock History Chart Window (Pure Win32 GDI Dark Mode)
 //!
-//! Cửa sổ hiển thị biểu đồ nhiệt độ CPU và GPU trong 1 giờ gần nhất:
+//! Cửa sổ hiển thị biểu đồ phần cứng đa chế độ CPU và GPU trong 1 giờ gần nhất:
 //! - Giao diện Dark Mode chuẩn Predator Theme (#121417).
 //! - Hoàn toàn bằng Win32 GDI thuần, Double-Buffering chống nhấp nháy (Flicker-Free).
-//! - Trục Y: Cố định 30°C - 100°C với lưới chia 10°C và đường cảnh báo 85°C.
+//! - Thanh chọn 3 chế độ (Mode Tabs) với hit-test chuột và phím tắt (1, 2, 3):
+//!   1. [ 🌡️ Nhiệt độ & Quạt ] (30°C - 100°C, cảnh báo 85°C)
+//!   2. [ ⚡ Công suất (W) ] (0 - 150 W, tự co giãn 200 W, vạch 30 W)
+//!   3. [ ⏱️ Xung nhịp (GHz) ] (0.0 - 5.5 GHz, vạch 1.0 GHz)
+//! - Thanh trạng thái HUD thời gian thực (Live Infobar):
+//!   "CPU: {temp}°C | {power:.1}W | {clock:.2} GHz   •   GPU: {temp}°C | {power:.1}W | {clock:.2} GHz"
 //! - Trục X: 1 giờ (3600 giây) chia mốc mỗi 10 phút (-60m .. Now).
 //! - Đường biểu diễn CPU (Cyan #00E5FF) và GPU (Orange #FF9100) độ dày 2px.
-//! - Tương tác chuột: Crosshair dọc và Tooltip hiển thị thời gian và nhiệt độ chi tiết.
+//! - Tương tác chuột: Crosshair dọc và Tooltip hiển thị thời gian và thông số chi tiết theo từng chế độ.
 //! - Tự động cập nhật mỗi 1 giây qua WM_TIMER.
 //! - Quản lý Singleton: Giữ cửa sổ duy nhất, ẩn khi đóng (WM_CLOSE) và khôi phục khi mở lại.
 
@@ -29,30 +34,90 @@ static ACTIVE_CHART_HWND: AtomicIsize = AtomicIsize::new(0);
 const TIMER_REFRESH: usize = 1;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
+/// Chế độ hiển thị biểu đồ phần cứng Predator
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum ChartMode {
+    #[default]
+    TempAndFan = 0, // 🌡️ Nhiệt độ (°C) & Quạt (%)
+    Power = 1,      // ⚡ Công suất (W)
+    Clock = 2,      // ⏱️ Xung nhịp (GHz)
+}
+
+impl ChartMode {
+    pub const fn from_index(idx: usize) -> Option<Self> {
+        match idx {
+            0 => Some(Self::TempAndFan),
+            1 => Some(Self::Power),
+            2 => Some(Self::Clock),
+            _ => None,
+        }
+    }
+
+    pub const fn to_index(self) -> usize {
+        self as usize
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::TempAndFan => "🌡️ Nhiệt độ & Quạt",
+            Self::Power => "⚡ Công suất (W)",
+            Self::Clock => "⏱️ Xung nhịp (GHz)",
+        }
+    }
+}
+
 /// Màu sắc theo bảng màu Predator Dark Theme
 #[inline]
-const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
+pub const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF((r as u32) | ((g as u32) << 8) | ((b as u32) << 16))
 }
 
-const COLOR_BG: COLORREF = rgb(18, 20, 23);         // #121417
-const COLOR_PLOT_BG: COLORREF = rgb(22, 25, 30);    // #16191E
-const COLOR_BORDER: COLORREF = rgb(52, 59, 72);     // #343B48
-const COLOR_GRID: COLORREF = rgb(40, 44, 52);       // #282C34
-const COLOR_WARN_85: COLORREF = rgb(229, 57, 53);   // #E53935
-const COLOR_CPU: COLORREF = rgb(0, 229, 255);       // #00E5FF (Cyan)
-const COLOR_GPU: COLORREF = rgb(255, 145, 0);       // #FF9100 (Orange)
+const COLOR_BG: COLORREF = rgb(18, 20, 23);           // #121417
+const COLOR_PLOT_BG: COLORREF = rgb(22, 25, 30);      // #16191E
+const COLOR_BORDER: COLORREF = rgb(52, 59, 72);       // #343B48
+const COLOR_GRID: COLORREF = rgb(40, 44, 52);         // #282C34
+const COLOR_WARN_85: COLORREF = rgb(229, 57, 53);     // #E53935
+const COLOR_CPU: COLORREF = rgb(0, 229, 255);         // #00E5FF (Cyan)
+const COLOR_GPU: COLORREF = rgb(255, 145, 0);         // #FF9100 (Orange)
 const COLOR_TEXT_MUTED: COLORREF = rgb(136, 146, 176); // #8892B0
 const COLOR_TEXT_LIGHT: COLORREF = rgb(230, 237, 243); // #E6EDF3
-const COLOR_CROSSHAIR: COLORREF = rgb(92, 99, 112); // #5C6370
-const COLOR_TOOLTIP_BG: COLORREF = rgb(26, 29, 36); // #1A1D24
+const COLOR_CROSSHAIR: COLORREF = rgb(92, 99, 112);   // #5C6370
+const COLOR_TOOLTIP_BG: COLORREF = rgb(26, 29, 36);   // #1A1D24
 const COLOR_TOOLTIP_BORDER: COLORREF = rgb(70, 78, 92); // #464E5C
+
+// Bảng màu cho thanh Tab
+const COLOR_TAB_BG_ACTIVE: COLORREF = rgb(34, 40, 49);     // #222831
+const COLOR_TAB_BG_INACTIVE: COLORREF = rgb(22, 25, 30);   // #16191E
+const COLOR_TAB_BORDER: COLORREF = rgb(52, 59, 72);        // #343B48
+const COLOR_TAB_INDICATOR: COLORREF = rgb(0, 229, 255);     // #00E5FF
+
+/// Vị trí tọa độ của từng nút Tab (Hit-Testing)
+pub fn get_tab_rect(mode: ChartMode) -> RECT {
+    match mode {
+        ChartMode::TempAndFan => RECT { left: 20, top: 8, right: 180, bottom: 34 },
+        ChartMode::Power => RECT { left: 186, top: 8, right: 326, bottom: 34 },
+        ChartMode::Clock => RECT { left: 332, top: 8, right: 482, bottom: 34 },
+    }
+}
+
+/// Hit-testing tìm tab khi người dùng click chuột
+pub fn hit_test_tab(x: i32, y: i32) -> Option<ChartMode> {
+    for &mode in &[ChartMode::TempAndFan, ChartMode::Power, ChartMode::Clock] {
+        let r = get_tab_rect(mode);
+        if x >= r.left && x <= r.right && y >= r.top && y <= r.bottom {
+            return Some(mode);
+        }
+    }
+    None
+}
 
 /// Trạng thái dữ liệu nội bộ gắn với HWND
 struct ChartWindowState {
     telemetry: Arc<Mutex<TelemetryHistory>>,
     mouse_pos: Option<POINT>,
     is_mouse_tracking: bool,
+    active_mode: ChartMode,
 }
 
 /// Mở hoặc đưa cửa sổ biểu đồ nhiệt độ lên phía trước (Singleton)
@@ -74,12 +139,12 @@ pub fn show_or_focus_chart_window(telemetry: Arc<Mutex<TelemetryHistory>>) {
 
     thread::spawn(move || {
         if let Err(e) = run_chart_window(telemetry) {
-            eprintln!("[ChartWindow] Lỗi khởi tạo cửa sổ biểu đồ nhiệt độ: {:?}", e);
+            eprintln!("[ChartWindow] Lỗi khởi tạo cửa sổ biểu đồ phần cứng: {:?}", e);
         }
     });
 }
 
-/// Chạy vòng lặp thông điệp của cửa sổ biểu đồ nhiệt độ
+/// Chạy vòng lặp thông điệp của cửa sổ biểu đồ
 fn run_chart_window(telemetry: Arc<Mutex<TelemetryHistory>>) -> Result<()> {
     unsafe {
         let hinstance = GetModuleHandleW(PCWSTR::null())?;
@@ -102,9 +167,9 @@ fn run_chart_window(telemetry: Arc<Mutex<TelemetryHistory>>) -> Result<()> {
 
         let _ = RegisterClassW(&wnd_class);
 
-        // Kích thước mặc định 800 x 520, căn giữa màn hình
-        let width = 800;
-        let height = 520;
+        // Kích thước mặc định 840 x 540, căn giữa màn hình
+        let width = 840;
+        let height = 540;
         let screen_w = GetSystemMetrics(SM_CXSCREEN);
         let screen_h = GetSystemMetrics(SM_CYSCREEN);
         let pos_x = (screen_w - width) / 2;
@@ -113,7 +178,7 @@ fn run_chart_window(telemetry: Arc<Mutex<TelemetryHistory>>) -> Result<()> {
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             class_name,
-            w!("Acer Predator - Lịch sử nhiệt độ phần cứng (1 Giờ)"),
+            w!("Acer Predator - Lịch sử phần cứng thời gian thực (1 Giờ)"),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             pos_x,
             pos_y,
@@ -136,6 +201,7 @@ fn run_chart_window(telemetry: Arc<Mutex<TelemetryHistory>>) -> Result<()> {
             telemetry,
             mouse_pos: None,
             is_mouse_tracking: false,
+            active_mode: ChartMode::TempAndFan,
         });
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
 
@@ -179,6 +245,68 @@ unsafe fn draw_text_line(hdc: HDC, x: i32, y: i32, text: &str, color: COLORREF) 
     let _ = TextOutW(hdc, x, y, &wide);
 }
 
+// ============================================================================
+// CÁC HÀM TÍNH TOÁN ÁNH XẠ TỌA ĐỘ (COORDINATE MAPPING & SCALING)
+// ============================================================================
+
+/// Ánh xạ thời gian (giây) sang tọa độ X trên Plot Area
+pub fn map_time_x(timestamp_secs: u64, newest_ts: u64, plot_left: i32, plot_right: i32) -> Option<i32> {
+    let k = newest_ts.saturating_sub(timestamp_secs);
+    if k > 3600 {
+        return None;
+    }
+    let plot_width = (plot_right - plot_left) as f32;
+    let x = plot_right as f32 - ((k as f32 / 3600.0) * plot_width);
+    Some((x.round() as i32).clamp(plot_left, plot_right))
+}
+
+/// Ánh xạ nhiệt độ (°C: 30°C - 100°C) sang tọa độ Y
+pub fn map_temp_y(temp: u8, plot_top: i32, plot_bottom: i32) -> i32 {
+    let plot_height = (plot_bottom - plot_top) as f32;
+    let ratio = (temp.clamp(30, 100) - 30) as f32 / 70.0;
+    plot_bottom - (ratio * plot_height).round() as i32
+}
+
+/// Tính toán thang đo trục Y công suất: mặc định 150W, tự động co giãn 200W nếu có đỉnh > 150W
+pub fn calculate_power_scale(samples: &[TelemetrySample]) -> f32 {
+    let mut peak = 0.0f32;
+    for s in samples {
+        let cpu_w = s.cpu_power_w();
+        let gpu_w = s.gpu_power_w();
+        if cpu_w > peak {
+            peak = cpu_w;
+        }
+        if gpu_w > peak {
+            peak = gpu_w;
+        }
+    }
+    if peak > 150.0 {
+        200.0
+    } else {
+        150.0
+    }
+}
+
+/// Ánh xạ công suất (W: 0 - 150W hoặc 0 - 200W) sang tọa độ Y
+pub fn map_power_y(power_w: f32, max_y: f32, plot_top: i32, plot_bottom: i32) -> i32 {
+    let plot_height = (plot_bottom - plot_top) as f32;
+    let clamped = power_w.clamp(0.0, max_y);
+    let ratio = clamped / max_y;
+    plot_bottom - (ratio * plot_height).round() as i32
+}
+
+/// Ánh xạ xung nhịp (GHz: 0.0 - 5.5 GHz) sang tọa độ Y
+pub fn map_clock_y(clock_ghz: f32, plot_top: i32, plot_bottom: i32) -> i32 {
+    let plot_height = (plot_bottom - plot_top) as f32;
+    let clamped = clock_ghz.clamp(0.0, 5.5);
+    let ratio = clamped / 5.5;
+    plot_bottom - (ratio * plot_height).round() as i32
+}
+
+// ============================================================================
+// HÀM VẼ GDI CHÍNH (DOUBLE-BUFFERING RENDER ENGINE)
+// ============================================================================
+
 /// Vẽ toàn bộ nội dung biểu đồ lên Memory DC (Double-Buffering)
 unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowState) {
     // 1. Tô nền toàn bộ cửa sổ #121417
@@ -194,40 +322,108 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
 
     SetBkMode(hdc, TRANSPARENT);
 
-    // Nạp dữ liệu thống kê và lịch sử từ bộ đệm Telemetry
-    let (stats_opt, samples) = if let Ok(hist) = state.telemetry.lock() {
-        (hist.stats(), hist.iter_chronological())
+    // Nạp dữ liệu lịch sử từ bộ đệm Telemetry
+    let samples = if let Ok(hist) = state.telemetry.lock() {
+        hist.iter_chronological()
     } else {
-        (None, Vec::new())
+        Vec::new()
     };
 
-    // 2. Vẽ Header Bar (Thông số thống kê thời gian thực)
-    let header_font = create_chart_font(16, FW_SEMIBOLD.0 as i32);
-    let old_font = SelectObject(hdc, header_font);
+    // 2. Vẽ Thanh chọn chế độ (Mode Tabs) trên đầu cửa sổ
+    let tab_font = create_chart_font(14, FW_MEDIUM.0 as i32);
+    let old_font = SelectObject(hdc, tab_font);
 
-    match stats_opt {
-        Some(stats) => {
-            let cpu_line = format!(
-                "[■ CPU] Hiện tại: {:2}°C | Min: {:2}°C | Max: {:2}°C | Trung bình: {:.1}°C",
-                stats.cpu_current, stats.cpu_min, stats.cpu_max, stats.cpu_avg
-            );
-            draw_text_line(hdc, 20, 12, &cpu_line, COLOR_CPU);
+    let tab_border_pen = CreatePen(PS_SOLID, 1, COLOR_TAB_BORDER);
+    let tab_indicator_pen = CreatePen(PS_SOLID, 2, COLOR_TAB_INDICATOR);
+    let old_pen = SelectObject(hdc, tab_border_pen);
 
-            let gpu_line = format!(
-                "[■ GPU] Hiện tại: {:2}°C | Min: {:2}°C | Max: {:2}°C | Trung bình: {:.1}°C",
-                stats.gpu_current, stats.gpu_min, stats.gpu_max, stats.gpu_avg
+    for &mode in &[ChartMode::TempAndFan, ChartMode::Power, ChartMode::Clock] {
+        let r = get_tab_rect(mode);
+        let is_active = state.active_mode == mode;
+
+        // Nền nút tab
+        let tab_brush = CreateSolidBrush(if is_active {
+            COLOR_TAB_BG_ACTIVE
+        } else {
+            COLOR_TAB_BG_INACTIVE
+        });
+        FillRect(hdc, &r, tab_brush);
+        let _ = DeleteObject(tab_brush);
+
+        // Viền nút tab
+        let _ = SelectObject(hdc, tab_border_pen);
+        let border_pts = [
+            POINT { x: r.left, y: r.top },
+            POINT { x: r.right, y: r.top },
+            POINT { x: r.right, y: r.bottom },
+            POINT { x: r.left, y: r.bottom },
+            POINT { x: r.left, y: r.top },
+        ];
+        let _ = Polyline(hdc, &border_pts);
+
+        // Đường gạch chân điểm nhấn (Indicator line) cho tab đang chọn
+        if is_active {
+            let _ = SelectObject(hdc, tab_indicator_pen);
+            let indicator_pts = [
+                POINT { x: r.left + 2, y: r.bottom - 1 },
+                POINT { x: r.right - 2, y: r.bottom - 1 },
+            ];
+            let _ = Polyline(hdc, &indicator_pts);
+        }
+
+        // Nhãn văn bản của Tab
+        let label_color = if is_active {
+            COLOR_CPU
+        } else {
+            COLOR_TEXT_MUTED
+        };
+        let text_x = r.left + 10;
+        let text_y = r.top + 4;
+        draw_text_line(hdc, text_x, text_y, mode.label(), label_color);
+    }
+
+    let _ = SelectObject(hdc, old_pen);
+    let _ = DeleteObject(tab_indicator_pen);
+    let _ = DeleteObject(tab_border_pen);
+
+    // 3. Thanh trạng thái HUD thời gian thực (Live Infobar)
+    let hud_font = create_chart_font(15, FW_SEMIBOLD.0 as i32);
+    let _ = SelectObject(hdc, hud_font);
+
+    match samples.last() {
+        Some(s) => {
+            let cpu_hud = format!(
+                "CPU: {}°C | {:.1}W | {:.2} GHz",
+                s.cpu_temp,
+                s.cpu_power_w(),
+                s.cpu_ghz()
             );
-            draw_text_line(hdc, 20, 33, &gpu_line, COLOR_GPU);
+            let gpu_hud = format!(
+                "GPU: {}°C | {:.1}W | {:.2} GHz",
+                s.gpu_temp,
+                s.gpu_power_w(),
+                s.gpu_ghz()
+            );
+            draw_text_line(hdc, 20, 44, &cpu_hud, COLOR_CPU);
+            draw_text_line(hdc, 235, 44, "•", COLOR_TEXT_MUTED);
+            draw_text_line(hdc, 252, 44, &gpu_hud, COLOR_GPU);
         }
         None => {
-            draw_text_line(hdc, 20, 12, "[■ CPU] Đang thu thập dữ liệu cảm biến...", COLOR_CPU);
-            draw_text_line(hdc, 20, 33, "[■ GPU] Đang thu thập dữ liệu cảm biến...", COLOR_GPU);
+            draw_text_line(
+                hdc,
+                20,
+                44,
+                "CPU: --°C | --.-W | -.-- GHz   •   GPU: --°C | --.-W | -.-- GHz (Đang thu thập dữ liệu...)",
+                COLOR_TEXT_MUTED,
+            );
         }
     }
 
-    // 3. Xác định vùng đồ thị (Plot Area): Lề trái 60, lề trên 60, lề phải 25, lề dưới 40
+    let _ = DeleteObject(hud_font);
+
+    // 4. Xác định vùng đồ thị (Plot Area): Lề trái 60, lề trên 72, lề phải 25, lề dưới 40
     let plot_left = 60;
-    let plot_top = 60;
+    let plot_top = 72;
     let plot_right = width - 25;
     let plot_bottom = height - 40;
 
@@ -236,7 +432,7 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
 
     if plot_width <= 50 || plot_height <= 50 {
         let _ = SelectObject(hdc, old_font);
-        let _ = DeleteObject(header_font);
+        let _ = DeleteObject(tab_font);
         return;
     }
 
@@ -251,38 +447,79 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
     FillRect(hdc, &plot_rect, plot_brush);
     let _ = DeleteObject(plot_brush);
 
-    // Khởi tạo font chữ nhỏ cho trục tọa độ và nhãn
+    // Font chữ nhỏ cho trục tọa độ và nhãn
     let label_font = create_chart_font(13, FW_NORMAL.0 as i32);
     let _ = SelectObject(hdc, label_font);
 
-    // 4. Trục Y: Nhiệt độ 30°C đến 100°C (bước 10°C)
     let grid_pen = CreatePen(PS_SOLID, 1, COLOR_GRID);
     let old_pen = SelectObject(hdc, grid_pen);
 
-    for temp in (30..=100).step_by(10) {
-        let ratio = (temp - 30) as f32 / 70.0;
-        let y = plot_bottom - (ratio * plot_height as f32).round() as i32;
+    // 5. Vẽ Trục Y theo từng Chế độ (Mode-Specific Y Axis)
+    let power_scale = calculate_power_scale(&samples);
 
-        // Đường lưới ngang
-        let pts = [POINT { x: plot_left, y }, POINT { x: plot_right, y }];
-        let _ = Polyline(hdc, &pts);
+    match state.active_mode {
+        ChartMode::TempAndFan => {
+            // Trục Y: Nhiệt độ 30°C đến 100°C (bước 10°C)
+            for temp in (30..=100).step_by(10) {
+                let y = map_temp_y(temp as u8, plot_top, plot_bottom);
 
-        // Nhãn nhiệt độ (°C) căn sát mép trái
-        let label = format!("{:3}°C", temp);
-        draw_text_line(hdc, plot_left - 48, y - 7, &label, COLOR_TEXT_MUTED);
+                // Đường lưới ngang
+                let pts = [POINT { x: plot_left, y }, POINT { x: plot_right, y }];
+                let _ = Polyline(hdc, &pts);
+
+                // Nhãn nhiệt độ (°C) căn mép trái
+                let label = format!("{:3}°C", temp);
+                draw_text_line(hdc, plot_left - 48, y - 7, &label, COLOR_TEXT_MUTED);
+            }
+
+            // Đường cảnh báo 85°C (Nét đứt màu đỏ #E53935)
+            let warn_y = map_temp_y(85, plot_top, plot_bottom);
+            let warn_pen = CreatePen(PS_DASH, 1, COLOR_WARN_85);
+            let _ = SelectObject(hdc, warn_pen);
+            let warn_pts = [POINT { x: plot_left, y: warn_y }, POINT { x: plot_right, y: warn_y }];
+            let _ = Polyline(hdc, &warn_pts);
+            draw_text_line(hdc, plot_right - 88, warn_y - 15, "85°C Warning", COLOR_WARN_85);
+            let _ = DeleteObject(warn_pen);
+            let _ = SelectObject(hdc, grid_pen);
+        }
+        ChartMode::Power => {
+            // Trục Y: Công suất 0 - 150 W (hoặc 200W nếu vượt đỉnh 150W), vạch chia mỗi 30 W
+            let max_w = power_scale as i32;
+            let mut marks: Vec<i32> = (0..=max_w).step_by(30).collect();
+            if *marks.last().unwrap_or(&0) < max_w {
+                marks.push(max_w);
+            }
+
+            for &w_val in &marks {
+                let y = map_power_y(w_val as f32, power_scale, plot_top, plot_bottom);
+
+                // Đường lưới ngang
+                let pts = [POINT { x: plot_left, y }, POINT { x: plot_right, y }];
+                let _ = Polyline(hdc, &pts);
+
+                // Nhãn công suất (W)
+                let label = format!("{:3} W", w_val);
+                draw_text_line(hdc, plot_left - 48, y - 7, &label, COLOR_TEXT_MUTED);
+            }
+        }
+        ChartMode::Clock => {
+            // Trục Y: Xung nhịp 0.0 - 5.5 GHz, chia vạch mỗi 1.0 GHz
+            let clock_marks: [f32; 7] = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 5.5];
+            for &ghz in &clock_marks {
+                let y = map_clock_y(ghz, plot_top, plot_bottom);
+
+                // Đường lưới ngang
+                let pts = [POINT { x: plot_left, y }, POINT { x: plot_right, y }];
+                let _ = Polyline(hdc, &pts);
+
+                // Nhãn xung nhịp (GHz)
+                let label = format!("{:.1}G", ghz);
+                draw_text_line(hdc, plot_left - 48, y - 7, &label, COLOR_TEXT_MUTED);
+            }
+        }
     }
 
-    // Đường cảnh báo 85°C (Nét đứt màu đỏ #E53935)
-    let warn_y = plot_bottom - (((85.0 - 30.0) / 70.0) * plot_height as f32).round() as i32;
-    let warn_pen = CreatePen(PS_DASH, 1, COLOR_WARN_85);
-    let _ = SelectObject(hdc, warn_pen);
-    let warn_pts = [POINT { x: plot_left, y: warn_y }, POINT { x: plot_right, y: warn_y }];
-    let _ = Polyline(hdc, &warn_pts);
-    draw_text_line(hdc, plot_right - 88, warn_y - 15, "85°C Warning", COLOR_WARN_85);
-    let _ = DeleteObject(warn_pen);
-
-    // 5. Trục X: Thời gian 1 giờ (3600 giây), các mốc: -60m, -50m, -40m, -30m, -20m, -10m, Now
-    let _ = SelectObject(hdc, grid_pen);
+    // 6. Trục X: Thời gian 1 giờ (3600 giây), các mốc: -60m .. Now
     let time_marks: [(i32, &str); 7] = [
         (60, "-60m"),
         (50, "-50m"),
@@ -323,7 +560,7 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
     let _ = Polyline(hdc, &border_pts);
     let _ = DeleteObject(border_pen);
 
-    // 6. Vẽ các đường biểu diễn (Polyline)
+    // 7. Vẽ các đường biểu diễn (Polyline) theo từng Chế độ
     let mut mapped_samples: Vec<(i32, i32, i32, &TelemetrySample)> = Vec::with_capacity(samples.len());
 
     if samples.is_empty() {
@@ -341,24 +578,27 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
         let mut gpu_pts: Vec<POINT> = Vec::with_capacity(samples.len());
 
         for s in &samples {
-            let k = newest_ts.saturating_sub(s.timestamp_secs);
-            if k > 3600 {
-                continue;
+            if let Some(x) = map_time_x(s.timestamp_secs, newest_ts, plot_left, plot_right) {
+                let (cpu_y, gpu_y) = match state.active_mode {
+                    ChartMode::TempAndFan => (
+                        map_temp_y(s.cpu_temp, plot_top, plot_bottom),
+                        map_temp_y(s.gpu_temp, plot_top, plot_bottom),
+                    ),
+                    ChartMode::Power => (
+                        map_power_y(s.cpu_power_w(), power_scale, plot_top, plot_bottom),
+                        map_power_y(s.gpu_power_w(), power_scale, plot_top, plot_bottom),
+                    ),
+                    ChartMode::Clock => (
+                        map_clock_y(s.cpu_ghz(), plot_top, plot_bottom),
+                        map_clock_y(s.gpu_ghz(), plot_top, plot_bottom),
+                    ),
+                };
+
+                cpu_pts.push(POINT { x, y: cpu_y });
+                gpu_pts.push(POINT { x, y: gpu_y });
+
+                mapped_samples.push((x, cpu_y, gpu_y, s));
             }
-
-            let x = plot_right - ((k as f32 / 3600.0) * plot_width as f32).round() as i32;
-            let x_clamped = x.clamp(plot_left, plot_right);
-
-            let cpu_ratio = (s.cpu_temp.clamp(30, 100) - 30) as f32 / 70.0;
-            let cpu_y = plot_bottom - (cpu_ratio * plot_height as f32).round() as i32;
-
-            let gpu_ratio = (s.gpu_temp.clamp(30, 100) - 30) as f32 / 70.0;
-            let gpu_y = plot_bottom - (gpu_ratio * plot_height as f32).round() as i32;
-
-            cpu_pts.push(POINT { x: x_clamped, y: cpu_y });
-            gpu_pts.push(POINT { x: x_clamped, y: gpu_y });
-
-            mapped_samples.push((x_clamped, cpu_y, gpu_y, s));
         }
 
         // Vẽ đường GPU (Cam #FF9100, 2px)
@@ -398,7 +638,7 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
         }
     }
 
-    // 7. Tương tác chuột (Crosshair & Tooltip)
+    // 8. Tương tác chuột (Crosshair & Tooltip)
     if let Some(m_pos) = state.mouse_pos {
         if m_pos.x >= plot_left && m_pos.x <= plot_right && m_pos.y >= plot_top && m_pos.y <= plot_bottom {
             if let Some(&(closest_x, cpu_y, gpu_y, sample)) = mapped_samples.iter().min_by_key(|(x, _, _, _)| (x - m_pos.x).abs()) {
@@ -426,7 +666,7 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
                 let _ = SelectObject(hdc, old_b);
                 let _ = DeleteObject(gpu_dot_brush);
 
-                // Tính toán thông tin hiển thị Tooltip
+                // Tính toán thông tin hiển thị Tooltip theo Chế độ hiện tại
                 let newest_ts = samples.last().map(|s| s.timestamp_secs).unwrap_or(0);
                 let k = newest_ts.saturating_sub(sample.timestamp_secs);
                 let time_str = if k == 0 {
@@ -437,8 +677,23 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
                     format!("-{}m {:02}s trước", k / 60, k % 60)
                 };
 
+                let (line_cpu, line_gpu) = match state.active_mode {
+                    ChartMode::TempAndFan => (
+                        format!("CPU: {}°C (Quạt: {}%)", sample.cpu_temp, sample.cpu_fan_pct),
+                        format!("GPU: {}°C (Quạt: {}%)", sample.gpu_temp, sample.gpu_fan_pct),
+                    ),
+                    ChartMode::Power => (
+                        format!("CPU: {:.1} W (Quạt: {}%)", sample.cpu_power_w(), sample.cpu_fan_pct),
+                        format!("GPU: {:.1} W (Quạt: {}%)", sample.gpu_power_w(), sample.gpu_fan_pct),
+                    ),
+                    ChartMode::Clock => (
+                        format!("CPU: {:.2} GHz ({} MHz)", sample.cpu_ghz(), sample.cpu_mhz),
+                        format!("GPU: {:.2} GHz ({} MHz)", sample.gpu_ghz(), sample.gpu_mhz),
+                    ),
+                };
+
                 // Vẽ hộp Tooltip
-                let tt_w = 168;
+                let tt_w = 176;
                 let tt_h = 76;
                 let mut tt_x = closest_x + 15;
                 let mut tt_y = m_pos.y - (tt_h / 2);
@@ -477,34 +732,22 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
                 let _ = DeleteObject(tt_border_pen);
 
                 draw_text_line(hdc, tt_x + 10, tt_y + 8, &time_str, COLOR_TEXT_LIGHT);
-                draw_text_line(
-                    hdc,
-                    tt_x + 10,
-                    tt_y + 28,
-                    &format!("CPU: {}°C (Quạt: {}%)", sample.cpu_temp, sample.cpu_fan_pct),
-                    COLOR_CPU,
-                );
-                draw_text_line(
-                    hdc,
-                    tt_x + 10,
-                    tt_y + 48,
-                    &format!("GPU: {}°C (Quạt: {}%)", sample.gpu_temp, sample.gpu_fan_pct),
-                    COLOR_GPU,
-                );
+                draw_text_line(hdc, tt_x + 10, tt_y + 28, &line_cpu, COLOR_CPU);
+                draw_text_line(hdc, tt_x + 10, tt_y + 48, &line_gpu, COLOR_GPU);
             }
         }
     }
 
-    // Dọn dẹp tài nguyên GDI
+    // Dọn dẹp tài nguyên GDI chặt chẽ (Zero GDI Leaks)
     let _ = SelectObject(hdc, old_pen);
     let _ = DeleteObject(grid_pen);
 
     let _ = SelectObject(hdc, old_font);
     let _ = DeleteObject(label_font);
-    let _ = DeleteObject(header_font);
+    let _ = DeleteObject(tab_font);
 }
 
-/// Window Procedure cho cửa sổ biểu đồ nhiệt độ
+/// Window Procedure cho cửa sổ biểu đồ
 unsafe extern "system" fn chart_wndproc(
     hwnd: HWND,
     msg: u32,
@@ -543,6 +786,41 @@ unsafe extern "system" fn chart_wndproc(
             }
 
             let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+
+            if let Some(new_mode) = hit_test_tab(x, y) {
+                let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ChartWindowState;
+                if let Some(state) = ptr.as_mut() {
+                    if state.active_mode != new_mode {
+                        state.active_mode = new_mode;
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+        WM_KEYDOWN => {
+            let key = wparam.0 as u32;
+            let target_mode = match key {
+                0x31 | 0x61 => Some(ChartMode::TempAndFan), // Phím '1' hoặc NumPad1
+                0x32 | 0x62 => Some(ChartMode::Power),      // Phím '2' hoặc NumPad2
+                0x33 | 0x63 => Some(ChartMode::Clock),      // Phím '3' hoặc NumPad3
+                _ => None,
+            };
+
+            if let Some(new_mode) = target_mode {
+                let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ChartWindowState;
+                if let Some(state) = ptr.as_mut() {
+                    if state.active_mode != new_mode {
+                        state.active_mode = new_mode;
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                }
+            }
             LRESULT(0)
         }
         WM_TIMER => {
@@ -609,6 +887,10 @@ unsafe extern "system" fn chart_wndproc(
     }
 }
 
+// ============================================================================
+// UNIT TESTS KIỂM CHỨNG TỌA ĐỘ VÀ CHUYỂN ĐỔI CHẾ ĐỘ
+// ============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,63 +908,154 @@ mod tests {
     }
 
     #[test]
-    fn test_x_coordinate_mapping() {
-        let plot_left = 60;
-        let plot_right = 775;
-        let plot_width = plot_right - plot_left; // 715
+    fn test_chart_mode_enum_and_conversion() {
+        assert_eq!(ChartMode::default(), ChartMode::TempAndFan);
+        assert_eq!(ChartMode::from_index(0), Some(ChartMode::TempAndFan));
+        assert_eq!(ChartMode::from_index(1), Some(ChartMode::Power));
+        assert_eq!(ChartMode::from_index(2), Some(ChartMode::Clock));
+        assert_eq!(ChartMode::from_index(3), None);
 
-        // Mẫu mới nhất k = 0
-        let k_0 = 0f32;
-        let x_0 = plot_right - ((k_0 / 3600.0) * plot_width as f32).round() as i32;
-        assert_eq!(x_0, plot_right);
+        assert_eq!(ChartMode::TempAndFan.to_index(), 0);
+        assert_eq!(ChartMode::Power.to_index(), 1);
+        assert_eq!(ChartMode::Clock.to_index(), 2);
 
-        // Mẫu cách 1 giờ k = 3600
-        let k_3600 = 3600f32;
-        let x_3600 = plot_right - ((k_3600 / 3600.0) * plot_width as f32).round() as i32;
-        assert_eq!(x_3600, plot_left);
-
-        // Mẫu cách 30 phút k = 1800
-        let k_1800 = 1800f32;
-        let x_1800 = plot_right - ((k_1800 / 3600.0) * plot_width as f32).round() as i32;
-        let expected_mid = plot_left + (plot_width / 2);
-        assert!((x_1800 - expected_mid).abs() <= 1);
+        assert_eq!(ChartMode::TempAndFan.label(), "🌡️ Nhiệt độ & Quạt");
+        assert_eq!(ChartMode::Power.label(), "⚡ Công suất (W)");
+        assert_eq!(ChartMode::Clock.label(), "⏱️ Xung nhịp (GHz)");
     }
 
     #[test]
-    fn test_y_coordinate_mapping() {
-        let plot_top = 60;
+    fn test_tab_hit_testing() {
+        // Tab 0: x: 20..=180, y: 8..=34
+        assert_eq!(hit_test_tab(20, 8), Some(ChartMode::TempAndFan));
+        assert_eq!(hit_test_tab(100, 20), Some(ChartMode::TempAndFan));
+        assert_eq!(hit_test_tab(180, 34), Some(ChartMode::TempAndFan));
+
+        // Khoảng trống giữa tab 0 và 1 (x: 181..185)
+        assert_eq!(hit_test_tab(183, 20), None);
+
+        // Tab 1: x: 186..=326, y: 8..=34
+        assert_eq!(hit_test_tab(186, 8), Some(ChartMode::Power));
+        assert_eq!(hit_test_tab(250, 20), Some(ChartMode::Power));
+        assert_eq!(hit_test_tab(326, 34), Some(ChartMode::Power));
+
+        // Khoảng trống giữa tab 1 và 2 (x: 327..331)
+        assert_eq!(hit_test_tab(329, 20), None);
+
+        // Tab 2: x: 332..=482, y: 8..=34
+        assert_eq!(hit_test_tab(332, 8), Some(ChartMode::Clock));
+        assert_eq!(hit_test_tab(400, 20), Some(ChartMode::Clock));
+        assert_eq!(hit_test_tab(482, 34), Some(ChartMode::Clock));
+
+        // Ngoài vùng Y
+        assert_eq!(hit_test_tab(100, 5), None);
+        assert_eq!(hit_test_tab(100, 35), None);
+
+        // Ngoài vùng X
+        assert_eq!(hit_test_tab(10, 20), None);
+        assert_eq!(hit_test_tab(500, 20), None);
+    }
+
+    #[test]
+    fn test_time_x_coordinate_mapping() {
+        let plot_left = 60;
+        let plot_right = 775;
+        let plot_width = plot_right - plot_left; // 715
+        let newest_ts = 10000u64;
+
+        // Mẫu mới nhất k = 0
+        let x_0 = map_time_x(newest_ts, newest_ts, plot_left, plot_right);
+        assert_eq!(x_0, Some(plot_right));
+
+        // Mẫu cách 1 giờ k = 3600
+        let x_3600 = map_time_x(newest_ts - 3600, newest_ts, plot_left, plot_right);
+        assert_eq!(x_3600, Some(plot_left));
+
+        // Mẫu cách 30 phút k = 1800 -> chính giữa
+        let x_1800 = map_time_x(newest_ts - 1800, newest_ts, plot_left, plot_right).unwrap();
+        let expected_mid = plot_left + (plot_width / 2);
+        assert!((x_1800 - expected_mid).abs() <= 1);
+
+        // Mẫu cũ hơn 1 giờ (>3600s) -> None
+        let x_old = map_time_x(newest_ts - 3601, newest_ts, plot_left, plot_right);
+        assert_eq!(x_old, None);
+    }
+
+    #[test]
+    fn test_temp_y_coordinate_mapping() {
+        let plot_top = 72;
         let plot_bottom = 480;
-        let plot_height = plot_bottom - plot_top; // 420
 
         // 30°C -> ở đáy plot (plot_bottom)
-        let t_30 = 30u8;
-        let ratio_30 = (t_30.clamp(30, 100) - 30) as f32 / 70.0;
-        let y_30 = plot_bottom - (ratio_30 * plot_height as f32).round() as i32;
-        assert_eq!(y_30, plot_bottom);
+        assert_eq!(map_temp_y(30, plot_top, plot_bottom), plot_bottom);
 
         // 100°C -> ở đỉnh plot (plot_top)
-        let t_100 = 100u8;
-        let ratio_100 = (t_100.clamp(30, 100) - 30) as f32 / 70.0;
-        let y_100 = plot_bottom - (ratio_100 * plot_height as f32).round() as i32;
-        assert_eq!(y_100, plot_top);
+        assert_eq!(map_temp_y(100, plot_top, plot_bottom), plot_top);
 
         // 65°C -> chính giữa trục Y
-        let t_65 = 65u8;
-        let ratio_65 = (t_65.clamp(30, 100) - 30) as f32 / 70.0;
-        let y_65 = plot_bottom - (ratio_65 * plot_height as f32).round() as i32;
-        assert_eq!(y_65, (plot_bottom + plot_top) / 2);
+        assert_eq!(map_temp_y(65, plot_top, plot_bottom), (plot_bottom + plot_top) / 2);
 
         // Dưới 30°C -> clamp về đáy
-        let t_below = 20u8;
-        let ratio_below = (t_below.clamp(30, 100) - 30) as f32 / 70.0;
-        let y_below = plot_bottom - (ratio_below * plot_height as f32).round() as i32;
-        assert_eq!(y_below, plot_bottom);
+        assert_eq!(map_temp_y(20, plot_top, plot_bottom), plot_bottom);
 
         // Trên 100°C -> clamp về đỉnh
-        let t_above = 115u8;
-        let ratio_above = (t_above.clamp(30, 100) - 30) as f32 / 70.0;
-        let y_above = plot_bottom - (ratio_above * plot_height as f32).round() as i32;
-        assert_eq!(y_above, plot_top);
+        assert_eq!(map_temp_y(115, plot_top, plot_bottom), plot_top);
+    }
+
+    #[test]
+    fn test_power_y_coordinate_mapping_and_scale() {
+        let plot_top = 72;
+        let plot_bottom = 480;
+
+        // Thang đo 150W tiêu chuẩn
+        let scale_150 = 150.0f32;
+        assert_eq!(map_power_y(0.0, scale_150, plot_top, plot_bottom), plot_bottom);
+        assert_eq!(map_power_y(150.0, scale_150, plot_top, plot_bottom), plot_top);
+        assert_eq!(map_power_y(75.0, scale_150, plot_top, plot_bottom), (plot_bottom + plot_top) / 2);
+
+        // Clamp
+        assert_eq!(map_power_y(-10.0, scale_150, plot_top, plot_bottom), plot_bottom);
+        assert_eq!(map_power_y(180.0, scale_150, plot_top, plot_bottom), plot_top);
+
+        // Thang đo 200W co giãn
+        let scale_200 = 200.0f32;
+        assert_eq!(map_power_y(0.0, scale_200, plot_top, plot_bottom), plot_bottom);
+        assert_eq!(map_power_y(200.0, scale_200, plot_top, plot_bottom), plot_top);
+        assert_eq!(map_power_y(100.0, scale_200, plot_top, plot_bottom), (plot_bottom + plot_top) / 2);
+
+        // Kiểm tra hàm tính scale tự động
+        let sample_normal = [TelemetrySample {
+            cpu_power_dw: 850, // 85.0 W
+            gpu_power_dw: 1150, // 115.0 W
+            ..Default::default()
+        }];
+        assert_eq!(calculate_power_scale(&sample_normal), 150.0);
+
+        let sample_heavy = [TelemetrySample {
+            cpu_power_dw: 1550, // 155.0 W (vượt 150W)
+            gpu_power_dw: 1200, // 120.0 W
+            ..Default::default()
+        }];
+        assert_eq!(calculate_power_scale(&sample_heavy), 200.0);
+    }
+
+    #[test]
+    fn test_clock_y_coordinate_mapping() {
+        let plot_top = 72;
+        let plot_bottom = 480;
+
+        // 0.0 GHz -> đáy
+        assert_eq!(map_clock_y(0.0, plot_top, plot_bottom), plot_bottom);
+
+        // 5.5 GHz -> đỉnh
+        assert_eq!(map_clock_y(5.5, plot_top, plot_bottom), plot_top);
+
+        // 2.75 GHz -> chính giữa
+        assert_eq!(map_clock_y(2.75, plot_top, plot_bottom), (plot_bottom + plot_top) / 2);
+
+        // Clamp
+        assert_eq!(map_clock_y(-0.5, plot_top, plot_bottom), plot_bottom);
+        assert_eq!(map_clock_y(6.0, plot_top, plot_bottom), plot_top);
     }
 
     #[test]
@@ -692,6 +1065,7 @@ mod tests {
             telemetry: telemetry.clone(),
             mouse_pos: None,
             is_mouse_tracking: false,
+            active_mode: ChartMode::TempAndFan,
         };
 
         // Khi rỗng
@@ -701,11 +1075,11 @@ mod tests {
             assert_eq!(hist.stats(), None);
         }
 
-        // Sau khi đẩy dữ liệu
+        // Sau khi đẩy dữ liệu với đầy đủ thông số (nhiệt độ, quạt, công suất, xung nhịp)
         {
             let mut hist = telemetry.lock().unwrap();
-            hist.push_with_timestamp(100, 48, 42, 35, 30);
-            hist.push_with_timestamp(101, 52, 45, 40, 35);
+            hist.push_with_timestamp(100, 48, 42, 35, 30, 420, 190, 3800, 2200);
+            hist.push_with_timestamp(101, 52, 45, 40, 35, 450, 210, 4200, 2300);
         }
 
         {
@@ -716,6 +1090,10 @@ mod tests {
             assert_eq!(stats.cpu_min, 48);
             assert_eq!(stats.cpu_max, 52);
             assert_eq!(stats.gpu_current, 45);
+            assert_eq!(stats.cpu_power_current, 450);
+            assert_eq!(stats.gpu_power_current, 210);
+            assert_eq!(stats.cpu_mhz_current, 4200);
+            assert_eq!(stats.gpu_mhz_current, 2300);
         }
     }
 }

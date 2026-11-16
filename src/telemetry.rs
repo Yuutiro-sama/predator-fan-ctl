@@ -1,12 +1,13 @@
 //! Acer Predator Ultra-Light Telemetry Ring Buffer Module
 //!
 //! Module quản lý bộ đệm xoay vòng (Fixed-Capacity Ring Buffer) lưu trữ
-//! dữ liệu cảm biến nhiệt độ và tốc độ quạt trong 1 giờ gần nhất.
+//! dữ liệu cảm biến nhiệt độ, tốc độ quạt, công suất và xung nhịp trong 1 giờ gần nhất.
 //!
 //! Đặc tính kỹ thuật:
 //! - Zero-allocation sau khi khởi tạo (mảng tĩnh 3600 phần tử trên Heap).
-//! - Mức tiêu thụ bộ nhớ cố định ~57.6 KB (3600 * 16 bytes).
-//! - Thời gian push O(1) < 50 ns, an toàn tuyệt đối khi dùng trong luồng điều khiển quạt thời gian thực.
+//! - Mức tiêu thụ bộ nhớ cố định ~84.4 KB (3600 * 24 bytes).
+//! - Căn lề chuẩn 8-byte boundary, kích thước struct đúng 24 bytes.
+//! - Thời gian push O(1) < 50 ns, an toàn tuyệt đối khi dùng trong luồng điều khiển thời gian thực.
 //! - Cung cấp hàm trích xuất dữ liệu theo đúng thứ tự thời gian (chronological) và tính toán thống kê (min, max, avg).
 
 use std::time::Instant;
@@ -16,13 +17,17 @@ pub const HISTORY_CAPACITY: usize = 3600;
 
 /// Mẫu dữ liệu cảm biến tại một thời điểm (Telemetry Sample).
 ///
-/// Định dạng bộ nhớ C-compatible với kích thước đúng 16 bytes:
+/// Định dạng bộ nhớ C-compatible với kích thước đúng 24 bytes:
 /// - `timestamp_secs`: 8 bytes (thời gian tương đối tính từ khi khởi động ứng dụng).
 /// - `cpu_temp`: 1 byte (°C).
 /// - `gpu_temp`: 1 byte (°C).
 /// - `cpu_fan_pct`: 1 byte (%).
 /// - `gpu_fan_pct`: 1 byte (%).
-/// - Đệm cấu trúc: 4 bytes padding căn lề 8-byte boundary.
+/// - `cpu_power_dw`: 2 bytes (Deciwatts: 425 = 42.5 W).
+/// - `gpu_power_dw`: 2 bytes (Deciwatts: 192 = 19.2 W).
+/// - `cpu_mhz`: 2 bytes (MHz: 3820 = 3.82 GHz).
+/// - `gpu_mhz`: 2 bytes (MHz: 2250 = 2.25 GHz).
+/// - Đệm căn lề: 4 bytes padding tự động để đảm bảo 8-byte boundary alignment.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct TelemetrySample {
@@ -36,11 +41,46 @@ pub struct TelemetrySample {
     pub cpu_fan_pct: u8,
     /// Tốc độ quạt GPU (%).
     pub gpu_fan_pct: u8,
+    /// Công suất CPU (Deciwatt: 0.1 W, ví dụ 428 = 42.8 W).
+    pub cpu_power_dw: u16,
+    /// Công suất GPU (Deciwatt: 0.1 W, ví dụ 192 = 19.2 W).
+    pub gpu_power_dw: u16,
+    /// Xung nhịp CPU cao nhất (MHz: ví dụ 3820 = 3.82 GHz).
+    pub cpu_mhz: u16,
+    /// Xung nhịp GPU (MHz: ví dụ 2250 = 2.25 GHz).
+    pub gpu_mhz: u16,
 }
 
-/// Thống kê nhanh dữ liệu nhiệt độ CPU và GPU trong bộ đệm hiện tại.
+impl TelemetrySample {
+    /// Công suất CPU quy đổi sang Watts (W).
+    #[inline]
+    pub fn cpu_power_w(&self) -> f32 {
+        self.cpu_power_dw as f32 / 10.0
+    }
+
+    /// Công suất GPU quy đổi sang Watts (W).
+    #[inline]
+    pub fn gpu_power_w(&self) -> f32 {
+        self.gpu_power_dw as f32 / 10.0
+    }
+
+    /// Xung nhịp CPU quy đổi sang Gigahertz (GHz).
+    #[inline]
+    pub fn cpu_ghz(&self) -> f32 {
+        self.cpu_mhz as f32 / 1000.0
+    }
+
+    /// Xung nhịp GPU quy đổi sang Gigahertz (GHz).
+    #[inline]
+    pub fn gpu_ghz(&self) -> f32 {
+        self.gpu_mhz as f32 / 1000.0
+    }
+}
+
+/// Thống kê chi tiết dữ liệu nhiệt độ, công suất và xung nhịp trong bộ đệm hiện tại.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct TelemetryStats {
+    // Nhiệt độ (°C)
     pub cpu_min: u8,
     pub cpu_max: u8,
     pub cpu_avg: f32,
@@ -49,6 +89,24 @@ pub struct TelemetryStats {
     pub gpu_avg: f32,
     pub cpu_current: u8,
     pub gpu_current: u8,
+    // Công suất (deciwatts: 0.1 W)
+    pub cpu_power_min: u16,
+    pub cpu_power_max: u16,
+    pub cpu_power_avg: f32,
+    pub gpu_power_min: u16,
+    pub gpu_power_max: u16,
+    pub gpu_power_avg: f32,
+    pub cpu_power_current: u16,
+    pub gpu_power_current: u16,
+    // Xung nhịp (MHz)
+    pub cpu_mhz_min: u16,
+    pub cpu_mhz_max: u16,
+    pub cpu_mhz_avg: f32,
+    pub gpu_mhz_min: u16,
+    pub gpu_mhz_max: u16,
+    pub gpu_mhz_avg: f32,
+    pub cpu_mhz_current: u16,
+    pub gpu_mhz_current: u16,
 }
 
 /// Bộ đệm vòng cố định dung lượng lưu trữ lịch sử cảm biến trong 1 giờ.
@@ -67,7 +125,6 @@ impl TelemetryHistory {
     /// Khởi tạo bộ đệm lịch sử với dung lượng cố định 3600 mẫu.
     /// Cấp phát duy nhất 1 lần trên Heap, không tái cấp phát trong quá trình chạy.
     pub fn new() -> Self {
-        // Cấp phát trực tiếp qua Box<[T]> để không chiếm dụng không gian stack trước khi chuyển sang heap.
         let boxed_slice = vec![TelemetrySample::default(); HISTORY_CAPACITY].into_boxed_slice();
         let buffer: Box<[TelemetrySample; HISTORY_CAPACITY]> = match boxed_slice.try_into() {
             Ok(b) => b,
@@ -85,9 +142,29 @@ impl TelemetryHistory {
     /// Thêm một mẫu cảm biến mới vào bộ đệm với thời gian tự động tính từ `start_instant`.
     ///
     /// Thao tác ghi đè tại `head`, cập nhật con trỏ vòng O(1), không cấp phát bộ nhớ.
-    pub fn push(&mut self, cpu_temp: u8, gpu_temp: u8, cpu_fan: u8, gpu_fan: u8) {
+    pub fn push(
+        &mut self,
+        cpu_temp: u8,
+        gpu_temp: u8,
+        cpu_fan: u8,
+        gpu_fan: u8,
+        cpu_power_dw: u16,
+        gpu_power_dw: u16,
+        cpu_mhz: u16,
+        gpu_mhz: u16,
+    ) {
         let timestamp_secs = self.start_instant.elapsed().as_secs();
-        self.push_with_timestamp(timestamp_secs, cpu_temp, gpu_temp, cpu_fan, gpu_fan);
+        self.push_with_timestamp(
+            timestamp_secs,
+            cpu_temp,
+            gpu_temp,
+            cpu_fan,
+            gpu_fan,
+            cpu_power_dw,
+            gpu_power_dw,
+            cpu_mhz,
+            gpu_mhz,
+        );
     }
 
     /// Thêm một mẫu cảm biến mới với mốc thời gian tùy chọn (hữu ích cho kiểm thử hoặc phục hồi dữ liệu).
@@ -98,6 +175,10 @@ impl TelemetryHistory {
         gpu_temp: u8,
         cpu_fan: u8,
         gpu_fan: u8,
+        cpu_power_dw: u16,
+        gpu_power_dw: u16,
+        cpu_mhz: u16,
+        gpu_mhz: u16,
     ) {
         self.buffer[self.head] = TelemetrySample {
             timestamp_secs,
@@ -105,6 +186,10 @@ impl TelemetryHistory {
             gpu_temp,
             cpu_fan_pct: cpu_fan,
             gpu_fan_pct: gpu_fan,
+            cpu_power_dw,
+            gpu_power_dw,
+            cpu_mhz,
+            gpu_mhz,
         };
 
         self.head = (self.head + 1) % HISTORY_CAPACITY;
@@ -185,6 +270,22 @@ impl TelemetryHistory {
         let mut gpu_max = u8::MIN;
         let mut gpu_sum: u64 = 0;
 
+        let mut cpu_pwr_min = u16::MAX;
+        let mut cpu_pwr_max = u16::MIN;
+        let mut cpu_pwr_sum: u64 = 0;
+
+        let mut gpu_pwr_min = u16::MAX;
+        let mut gpu_pwr_max = u16::MIN;
+        let mut gpu_pwr_sum: u64 = 0;
+
+        let mut cpu_mhz_min = u16::MAX;
+        let mut cpu_mhz_max = u16::MIN;
+        let mut cpu_mhz_sum: u64 = 0;
+
+        let mut gpu_mhz_min = u16::MAX;
+        let mut gpu_mhz_max = u16::MIN;
+        let mut gpu_mhz_sum: u64 = 0;
+
         let count = self.len;
 
         for sample in s1.iter().chain(s2.iter()) {
@@ -195,6 +296,22 @@ impl TelemetryHistory {
             gpu_min = gpu_min.min(sample.gpu_temp);
             gpu_max = gpu_max.max(sample.gpu_temp);
             gpu_sum += sample.gpu_temp as u64;
+
+            cpu_pwr_min = cpu_pwr_min.min(sample.cpu_power_dw);
+            cpu_pwr_max = cpu_pwr_max.max(sample.cpu_power_dw);
+            cpu_pwr_sum += sample.cpu_power_dw as u64;
+
+            gpu_pwr_min = gpu_pwr_min.min(sample.gpu_power_dw);
+            gpu_pwr_max = gpu_pwr_max.max(sample.gpu_power_dw);
+            gpu_pwr_sum += sample.gpu_power_dw as u64;
+
+            cpu_mhz_min = cpu_mhz_min.min(sample.cpu_mhz);
+            cpu_mhz_max = cpu_mhz_max.max(sample.cpu_mhz);
+            cpu_mhz_sum += sample.cpu_mhz as u64;
+
+            gpu_mhz_min = gpu_mhz_min.min(sample.gpu_mhz);
+            gpu_mhz_max = gpu_mhz_max.max(sample.gpu_mhz);
+            gpu_mhz_sum += sample.gpu_mhz as u64;
         }
 
         Some(TelemetryStats {
@@ -206,6 +323,22 @@ impl TelemetryHistory {
             gpu_avg: gpu_sum as f32 / count as f32,
             cpu_current: current_sample.cpu_temp,
             gpu_current: current_sample.gpu_temp,
+            cpu_power_min: cpu_pwr_min,
+            cpu_power_max: cpu_pwr_max,
+            cpu_power_avg: cpu_pwr_sum as f32 / count as f32,
+            gpu_power_min: gpu_pwr_min,
+            gpu_power_max: gpu_pwr_max,
+            gpu_power_avg: gpu_pwr_sum as f32 / count as f32,
+            cpu_power_current: current_sample.cpu_power_dw,
+            gpu_power_current: current_sample.gpu_power_dw,
+            cpu_mhz_min,
+            cpu_mhz_max,
+            cpu_mhz_avg: cpu_mhz_sum as f32 / count as f32,
+            gpu_mhz_min,
+            gpu_mhz_max,
+            gpu_mhz_avg: gpu_mhz_sum as f32 / count as f32,
+            cpu_mhz_current: current_sample.cpu_mhz,
+            gpu_mhz_current: current_sample.gpu_mhz,
         })
     }
 
@@ -232,9 +365,9 @@ mod tests {
         assert_eq!(history.len(), 0);
         assert!(history.is_empty());
 
-        history.push_with_timestamp(10, 45, 40, 30, 30);
-        history.push_with_timestamp(11, 48, 42, 35, 32);
-        history.push_with_timestamp(12, 52, 44, 40, 35);
+        history.push_with_timestamp(10, 45, 40, 30, 30, 420, 200, 3800, 2100);
+        history.push_with_timestamp(11, 48, 42, 35, 32, 450, 220, 4000, 2200);
+        history.push_with_timestamp(12, 52, 44, 40, 35, 550, 300, 4500, 2300);
 
         assert_eq!(history.len(), 3);
         assert!(!history.is_empty());
@@ -245,6 +378,10 @@ mod tests {
         assert_eq!(samples[0].timestamp_secs, 10);
         assert_eq!(samples[0].cpu_temp, 45);
         assert_eq!(samples[0].gpu_temp, 40);
+        assert_eq!(samples[0].cpu_power_dw, 420);
+        assert_eq!(samples[0].gpu_power_dw, 200);
+        assert_eq!(samples[0].cpu_mhz, 3800);
+        assert_eq!(samples[0].gpu_mhz, 2100);
 
         assert_eq!(samples[1].timestamp_secs, 11);
         assert_eq!(samples[1].cpu_temp, 48);
@@ -266,7 +403,21 @@ mod tests {
         for i in 0..5000u64 {
             let cpu_temp = ((i % 50) + 40) as u8;
             let gpu_temp = ((i % 40) + 35) as u8;
-            history.push_with_timestamp(i, cpu_temp, gpu_temp, 50, 50);
+            let cpu_power_dw = ((i % 500) + 200) as u16;
+            let gpu_power_dw = ((i % 400) + 100) as u16;
+            let cpu_mhz = ((i % 2000) + 2500) as u16;
+            let gpu_mhz = ((i % 1000) + 1500) as u16;
+            history.push_with_timestamp(
+                i,
+                cpu_temp,
+                gpu_temp,
+                50,
+                50,
+                cpu_power_dw,
+                gpu_power_dw,
+                cpu_mhz,
+                gpu_mhz,
+            );
         }
 
         // Kiểm tra dung lượng giữ cố định 3600 mẫu
@@ -303,12 +454,13 @@ mod tests {
     fn test_stats_calculation() {
         let mut history = TelemetryHistory::new();
 
-        history.push_with_timestamp(1, 40, 30, 20, 20);
-        history.push_with_timestamp(2, 50, 45, 30, 30);
-        history.push_with_timestamp(3, 60, 60, 40, 40);
+        history.push_with_timestamp(1, 40, 30, 20, 20, 300, 100, 3000, 1500);
+        history.push_with_timestamp(2, 50, 45, 30, 30, 450, 200, 4000, 2000);
+        history.push_with_timestamp(3, 60, 60, 40, 40, 600, 300, 5000, 2500);
 
         let stats = history.stats().expect("stats should be calculated");
 
+        // Nhiệt độ
         assert_eq!(stats.cpu_min, 40);
         assert_eq!(stats.cpu_max, 60);
         assert!((stats.cpu_avg - 50.0).abs() < 1e-4);
@@ -318,6 +470,48 @@ mod tests {
         assert_eq!(stats.gpu_max, 60);
         assert!((stats.gpu_avg - 45.0).abs() < 1e-4);
         assert_eq!(stats.gpu_current, 60);
+
+        // Công suất
+        assert_eq!(stats.cpu_power_min, 300);
+        assert_eq!(stats.cpu_power_max, 600);
+        assert!((stats.cpu_power_avg - 450.0).abs() < 1e-4);
+        assert_eq!(stats.cpu_power_current, 600);
+
+        assert_eq!(stats.gpu_power_min, 100);
+        assert_eq!(stats.gpu_power_max, 300);
+        assert!((stats.gpu_power_avg - 200.0).abs() < 1e-4);
+        assert_eq!(stats.gpu_power_current, 300);
+
+        // Xung nhịp
+        assert_eq!(stats.cpu_mhz_min, 3000);
+        assert_eq!(stats.cpu_mhz_max, 5000);
+        assert!((stats.cpu_mhz_avg - 4000.0).abs() < 1e-4);
+        assert_eq!(stats.cpu_mhz_current, 5000);
+
+        assert_eq!(stats.gpu_mhz_min, 1500);
+        assert_eq!(stats.gpu_mhz_max, 2500);
+        assert!((stats.gpu_mhz_avg - 2000.0).abs() < 1e-4);
+        assert_eq!(stats.gpu_mhz_current, 2500);
+    }
+
+    #[test]
+    fn test_helpers() {
+        let sample = TelemetrySample {
+            timestamp_secs: 100,
+            cpu_temp: 70,
+            gpu_temp: 65,
+            cpu_fan_pct: 55,
+            gpu_fan_pct: 50,
+            cpu_power_dw: 428, // 42.8 W
+            gpu_power_dw: 195, // 19.5 W
+            cpu_mhz: 3820,     // 3.82 GHz
+            gpu_mhz: 2250,     // 2.25 GHz
+        };
+
+        assert!((sample.cpu_power_w() - 42.8).abs() < 1e-4);
+        assert!((sample.gpu_power_w() - 19.5).abs() < 1e-4);
+        assert!((sample.cpu_ghz() - 3.82).abs() < 1e-4);
+        assert!((sample.gpu_ghz() - 2.25).abs() < 1e-4);
     }
 
     #[test]
@@ -339,10 +533,12 @@ mod tests {
 
     #[test]
     fn test_sample_layout_and_size() {
-        assert_eq!(std::mem::size_of::<TelemetrySample>(), 16);
+        // Đúng 24 bytes theo đặc tả kỹ thuật plan.md
+        assert_eq!(std::mem::size_of::<TelemetrySample>(), 24);
+        // Đúng 86.400 bytes (~84.4 KB) trên Heap
         assert_eq!(
             std::mem::size_of::<[TelemetrySample; HISTORY_CAPACITY]>(),
-            3600 * 16
+            3600 * 24
         );
     }
 
@@ -351,8 +547,8 @@ mod tests {
         let mut history = TelemetryHistory::new();
 
         // 1. Dưới dung lượng tối đa
-        history.push_with_timestamp(1, 40, 40, 20, 20);
-        history.push_with_timestamp(2, 45, 45, 25, 25);
+        history.push_with_timestamp(1, 40, 40, 20, 20, 300, 100, 3000, 1500);
+        history.push_with_timestamp(2, 45, 45, 25, 25, 350, 120, 3200, 1600);
         let (s1, s2) = history.as_slices();
         assert_eq!(s1.len(), 2);
         assert_eq!(s2.len(), 0);
@@ -361,14 +557,14 @@ mod tests {
 
         // 2. Điền đầy đúng 3600 mẫu
         for i in 2..3600u64 {
-            history.push_with_timestamp(i + 1, 50, 50, 30, 30);
+            history.push_with_timestamp(i + 1, 50, 50, 30, 30, 400, 150, 3500, 1800);
         }
         assert_eq!(history.len(), 3600);
         let (s1, s2) = history.as_slices();
         assert_eq!(s1.len() + s2.len(), 3600);
 
         // 3. Vượt quá 1 mẫu (head = 1)
-        history.push_with_timestamp(3601, 70, 70, 60, 60);
+        history.push_with_timestamp(3601, 70, 70, 60, 60, 550, 250, 4200, 2200);
         assert_eq!(history.len(), 3600);
         let (s1, s2) = history.as_slices();
         assert_eq!(s1.len(), 3599);
@@ -380,8 +576,8 @@ mod tests {
     #[test]
     fn test_clear_buffer() {
         let mut history = TelemetryHistory::new();
-        history.push_with_timestamp(1, 50, 50, 30, 30);
-        history.push_with_timestamp(2, 60, 60, 40, 40);
+        history.push_with_timestamp(1, 50, 50, 30, 30, 400, 150, 3500, 1800);
+        history.push_with_timestamp(2, 60, 60, 40, 40, 500, 200, 4000, 2000);
         assert_eq!(history.len(), 2);
 
         history.clear();

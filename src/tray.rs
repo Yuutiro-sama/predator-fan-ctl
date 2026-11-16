@@ -109,6 +109,10 @@ pub struct TrayState {
     pub governor_enabled: AtomicBool,
     pub governor_target_temp: AtomicU32,
     pub governor_epp: AtomicU32,
+    pub cpu_power_dw: AtomicU32,
+    pub gpu_power_dw: AtomicU32,
+    pub cpu_mhz: AtomicU32,
+    pub gpu_mhz: AtomicU32,
 }
 
 impl Default for TrayState {
@@ -124,6 +128,10 @@ impl Default for TrayState {
             governor_enabled: AtomicBool::new(true),
             governor_target_temp: AtomicU32::new(80),
             governor_epp: AtomicU32::new(0),
+            cpu_power_dw: AtomicU32::new(0),
+            gpu_power_dw: AtomicU32::new(0),
+            cpu_mhz: AtomicU32::new(0),
+            gpu_mhz: AtomicU32::new(0),
         }
     }
 }
@@ -140,6 +148,39 @@ impl TrayState {
         self.gpu_speed.store(gpu_speed, Ordering::Relaxed);
         self.cpu_rpm.store(cpu_rpm, Ordering::Relaxed);
         self.gpu_rpm.store(gpu_rpm, Ordering::Relaxed);
+    }
+
+    pub fn update_metrics(&self, cpu_power_dw: u16, gpu_power_dw: u16, cpu_mhz: u16, gpu_mhz: u16) {
+        self.cpu_power_dw.store(cpu_power_dw as u32, Ordering::Relaxed);
+        self.gpu_power_dw.store(gpu_power_dw as u32, Ordering::Relaxed);
+        self.cpu_mhz.store(cpu_mhz as u32, Ordering::Relaxed);
+        self.gpu_mhz.store(gpu_mhz as u32, Ordering::Relaxed);
+    }
+
+    pub fn get_metrics(&self) -> (u16, u16, u16, u16) {
+        (
+            self.cpu_power_dw.load(Ordering::Relaxed) as u16,
+            self.gpu_power_dw.load(Ordering::Relaxed) as u16,
+            self.cpu_mhz.load(Ordering::Relaxed) as u16,
+            self.gpu_mhz.load(Ordering::Relaxed) as u16,
+        )
+    }
+
+    pub fn update_full_status(
+        &self,
+        cpu_temp: u32,
+        cpu_speed: u8,
+        gpu_temp: u32,
+        gpu_speed: u8,
+        cpu_rpm: u32,
+        gpu_rpm: u32,
+        cpu_power_dw: u16,
+        gpu_power_dw: u16,
+        cpu_mhz: u16,
+        gpu_mhz: u16,
+    ) {
+        self.update_status(cpu_temp, cpu_speed, gpu_temp, gpu_speed, cpu_rpm, gpu_rpm);
+        self.update_metrics(cpu_power_dw, gpu_power_dw, cpu_mhz, gpu_mhz);
     }
 
     pub fn update_governor_status(&self, enabled: bool, target_temp: u32, epp: u32) {
@@ -192,6 +233,21 @@ impl TrayState {
             self.gpu_rpm.load(Ordering::Relaxed),
         )
     }
+
+    /// Định dạng chuỗi tooltip hiển thị chi tiết: CPU: XX°C XX.XW X.XXGHz | GPU: XX°C XX.XW X.XXGHz
+    pub fn format_tooltip(&self) -> String {
+        let (cpu_temp, _cpu_speed, gpu_temp, _gpu_speed) = self.get_status();
+        let (cpu_power_dw, gpu_power_dw, cpu_mhz, gpu_mhz) = self.get_metrics();
+        format!(
+            "CPU: {}°C {:.1}W {:.2}GHz | GPU: {}°C {:.1}W {:.2}GHz",
+            cpu_temp,
+            cpu_power_dw as f32 / 10.0,
+            cpu_mhz as f32 / 1000.0,
+            gpu_temp,
+            gpu_power_dw as f32 / 10.0,
+            gpu_mhz as f32 / 1000.0,
+        )
+    }
 }
 
 /// Cấu trúc nội bộ gắn vào `GWLP_USERDATA` của cửa sổ ẩn
@@ -218,6 +274,33 @@ impl TrayHandle {
     /// Cập nhật thông số nhiệt độ, tốc độ quạt (%) và RPM hiển thị tức thì trên menu
     pub fn update_status(&self, cpu_temp: u32, cpu_speed: u8, gpu_temp: u32, gpu_speed: u8, cpu_rpm: u32, gpu_rpm: u32) {
         self.state.update_status(cpu_temp, cpu_speed, gpu_temp, gpu_speed, cpu_rpm, gpu_rpm);
+    }
+
+    pub fn update_metrics(&self, cpu_power_dw: u16, gpu_power_dw: u16, cpu_mhz: u16, gpu_mhz: u16) {
+        self.state.update_metrics(cpu_power_dw, gpu_power_dw, cpu_mhz, gpu_mhz);
+    }
+
+    pub fn get_metrics(&self) -> (u16, u16, u16, u16) {
+        self.state.get_metrics()
+    }
+
+    pub fn update_full_status(
+        &self,
+        cpu_temp: u32,
+        cpu_speed: u8,
+        gpu_temp: u32,
+        gpu_speed: u8,
+        cpu_rpm: u32,
+        gpu_rpm: u32,
+        cpu_power_dw: u16,
+        gpu_power_dw: u16,
+        cpu_mhz: u16,
+        gpu_mhz: u16,
+    ) {
+        self.state.update_full_status(
+            cpu_temp, cpu_speed, gpu_temp, gpu_speed, cpu_rpm, gpu_rpm,
+            cpu_power_dw, gpu_power_dw, cpu_mhz, gpu_mhz,
+        );
     }
 
     pub fn update_governor_status(&self, enabled: bool, target_temp: u32, epp: u32) {
@@ -263,6 +346,17 @@ impl TrayHandle {
 
     pub fn state(&self) -> Arc<TrayState> {
         self.state.clone()
+    }
+
+    /// Định dạng chuỗi tooltip trạng thái chi tiết
+    pub fn format_tooltip(&self) -> String {
+        self.state.format_tooltip()
+    }
+
+    /// Cập nhật tooltip theo các thông số hiện thời
+    pub fn update_status_tooltip(&self) {
+        let tip = self.format_tooltip();
+        self.update_tooltip(&tip);
     }
 
     /// Yêu cầu đóng ứng dụng an toàn từ xa
@@ -342,13 +436,17 @@ impl TrayManager {
             let context_ptr = Box::into_raw(context);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, context_ptr as isize);
 
-            // Cho phép các thông điệp UIPI từ tiến trình không đặc quyền (non-elevated) gửi tới
+            // Cho phép các thông điệp UIPI từ tiến trình không đặc quyền (non-elevated / Explorer.exe) gửi tới
             let _ = ChangeWindowMessageFilterEx(hwnd, WM_COMMAND, MSGFLT_ALLOW, None);
             let _ = ChangeWindowMessageFilterEx(hwnd, WM_CLOSE, MSGFLT_ALLOW, None);
+            let _ = ChangeWindowMessageFilterEx(hwnd, WM_TRAYICON, MSGFLT_ALLOW, None);
 
             // Đăng ký nhận thông báo TaskbarCreated từ Explorer khi Shell khởi động hoặc vẽ lại
             let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
             WM_TASKBAR_CREATED.store(taskbar_created, Ordering::SeqCst);
+            if taskbar_created != 0 {
+                let _ = ChangeWindowMessageFilterEx(hwnd, taskbar_created, MSGFLT_ALLOW, None);
+            }
 
             // Đăng ký Icon vào Shell System Tray với cơ chế retry thông minh
             let mut nid = NOTIFYICONDATAW::default();
@@ -878,6 +976,20 @@ mod tests {
         assert!(!toggled);
         assert!(!state.is_governor_enabled());
         assert_eq!(state.get_governor_info(), (false, 85, 25));
+
+        // Kiểm tra Metrics (Power & Clock)
+        assert_eq!(state.get_metrics(), (0, 0, 0, 0));
+        state.update_metrics(428, 195, 3820, 2250);
+        assert_eq!(state.get_metrics(), (428, 195, 3820, 2250));
+
+        // Kiểm tra update_full_status
+        state.update_full_status(60, 50, 65, 55, 2600, 2300, 450, 210, 4100, 2300);
+        assert_eq!(state.get_status_rpm(), (60, 50, 65, 55, 2600, 2300));
+        assert_eq!(state.get_metrics(), (450, 210, 4100, 2300));
+
+        // Kiểm tra format_tooltip: "CPU: XX°C XX.XW X.XXGHz | GPU: XX°C XX.XW X.XXGHz"
+        let tooltip = state.format_tooltip();
+        assert_eq!(tooltip, "CPU: 60°C 45.0W 4.10GHz | GPU: 65°C 21.0W 2.30GHz");
     }
 
     #[test]
@@ -902,5 +1014,18 @@ mod tests {
     fn test_load_embedded_app_icon() {
         let icon = load_embedded_app_icon();
         assert!(!icon.is_invalid());
+    }
+
+    #[test]
+    fn test_tray_window_creation_and_find() {
+        let telemetry = Arc::new(std::sync::Mutex::new(crate::telemetry::TelemetryHistory::new()));
+        let (tray, _handle, _rx) = TrayManager::create(telemetry).expect("TrayManager::create failed");
+        let hwnd = tray.hwnd();
+        assert!(!hwnd.0.is_null());
+        unsafe {
+            let found = FindWindowW(w!("PredatorFanTrayWindowClass"), w!("PredatorFanTray"));
+            assert!(found.is_ok(), "FindWindowW must find PredatorFanTray");
+            assert_eq!(found.unwrap(), hwnd);
+        }
     }
 }
