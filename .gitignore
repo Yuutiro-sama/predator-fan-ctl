@@ -1,1 +1,14 @@
-/target
+# Rust build artifacts
+target/
+**/*.rs.bk
+*.pdb
+
+# Installers and binaries
+dist/*.exe
+
+# Logs and runtime traces
+*.log
+
+# Operating system files
+.DS_Store
+Thumbs.db
