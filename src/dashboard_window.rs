@@ -271,32 +271,37 @@ pub fn compute_dashboard_layout(
         }
     };
 
-    // 1. Nút đổi Giao diện (Header Theme Toggle)
+    // 1. Nút đổi Giao diện (Header Theme Toggle): Chiều rộng 135 px, neo ở w - 145, top: 10, bottom: 40
     let theme_btn_rect = RECT {
-        left: w - 120,
+        left: w - 145,
         top: 10,
-        right: w - 16,
-        bottom: 38,
+        right: w - 10,
+        bottom: 40,
     };
 
-    // Phân bổ chiều dọc linh hoạt (Responsive Vertical Distribution)
-    let available_content = (h - 48 - 16).max(340);
-    let card_h = (available_content * 38 / 100).clamp(145, 260);
-    let card_bottom = 48 + card_h;
+    // Phân bổ chiều dọc linh hoạt (Proportional Vertical Flex Layout - Không để lại khoảng trống đen)
+    let content_top = 48;
+    let content_bottom = h - 16;
+    let available_content = (content_bottom - content_top).max(330);
 
-    let base_gap = ((available_content - (card_h + 34 + 34 + 72)) / 4).clamp(6, 20);
+    let prof_h = ((available_content * 9) / 100).clamp(38, 44);
+    let epp_h = prof_h;
+    let tool_row_h = prof_h;
+
+    let base_gap = ((available_content * 32) / 1000).clamp(10, 24);
+    let tool_gap = (base_gap * 3 / 4).max(8);
+
+    let total_fixed_lower = prof_h + epp_h + (tool_row_h * 2) + (base_gap * 3) + tool_gap;
+    let card_h = (available_content - total_fixed_lower).max(140);
+    let card_bottom = content_top + card_h;
 
     let prof_y_top = card_bottom + base_gap;
-    let prof_h = (available_content * 9 / 100).clamp(34, 48);
     let prof_y_bottom = prof_y_top + prof_h;
 
     let epp_y_top = prof_y_bottom + base_gap;
-    let epp_h = prof_h;
     let epp_y_bottom = epp_y_top + epp_h;
 
     let tools_y_top = epp_y_bottom + base_gap;
-    let tool_row_h = prof_h;
-    let tool_gap = (base_gap / 2).max(4);
     let tool_r1_top = tools_y_top;
     let tool_r1_bottom = tool_r1_top + tool_row_h;
     let tool_r2_top = tool_r1_bottom + tool_gap;
@@ -307,13 +312,13 @@ pub fn compute_dashboard_layout(
     let card_w = (w - 32 - card_gap) / 2;
     let card_cpu_rect = RECT {
         left: 16,
-        top: 48,
+        top: content_top,
         right: 16 + card_w,
         bottom: card_bottom,
     };
     let card_gpu_rect = RECT {
         left: 16 + card_w + card_gap,
-        top: 48,
+        top: content_top,
         right: w - 16,
         bottom: card_bottom,
     };
@@ -347,12 +352,15 @@ pub fn compute_dashboard_layout(
         right: w - 16,
         bottom: epp_y_bottom,
     };
-    let epp_btn_h = 30.min(epp_h - 4);
+    let epp_btn_w = 125;
+    let epp_btn_h = 32.min(epp_h - 4);
     let epp_btn_top = epp_y_top + (epp_h - epp_btn_h) / 2;
+    let epp_btn_right = w - 24;
+    let epp_btn_left = epp_btn_right - epp_btn_w;
     let epp_btn_rect = RECT {
-        left: w - 16 - 135,
+        left: epp_btn_left,
         top: epp_btn_top,
-        right: w - 24,
+        right: epp_btn_right,
         bottom: epp_btn_top + epp_btn_h,
     };
     let epp_label = if snapshot.governor_enabled {
@@ -559,7 +567,7 @@ fn run_dashboard_window(
         let window_style = WS_OVERLAPPEDWINDOW;
 
         let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
+            WS_EX_APPWINDOW | WS_EX_TOPMOST,
             class_name,
             w!("Predator Fan Control // Dashboard"),
             window_style | WS_VISIBLE,
@@ -661,11 +669,159 @@ unsafe fn create_dpi_font_tenth(hwnd: HWND, point_size_x10: i32, weight: i32) ->
     )
 }
 
-/// Helper vẽ chuỗi văn bản với TextOutW
-unsafe fn draw_text_line(hdc: HDC, x: i32, y: i32, text: &str, color: COLORREF) {
+/// Helper vẽ chuỗi văn bản với DrawTextW và clipping an toàn
+unsafe fn draw_text_clipped(
+    hdc: HDC,
+    mut rect: RECT,
+    text: &str,
+    color: COLORREF,
+    flags: DRAW_TEXT_FORMAT,
+) {
     SetTextColor(hdc, color);
-    let wide: Vec<u16> = text.encode_utf16().collect();
-    let _ = TextOutW(hdc, x, y, &wide);
+    let mut wide: Vec<u16> = text.encode_utf16().collect();
+    let _ = DrawTextW(hdc, &mut wide, &mut rect, flags);
+}
+
+/// Vẽ một Card Telemetry (CPU hoặc GPU) theo kiến trúc Multi-Line với Clipping Bounds an toàn
+unsafe fn draw_telemetry_card(
+    hdc: HDC,
+    card_rect: RECT,
+    title: &str,
+    temp: u32,
+    power_dw: u16,
+    mhz: u16,
+    speed: u8,
+    rpm: u32,
+    accent_color: COLORREF,
+    palette: &ThemePalette,
+    font_header: HFONT,
+    font_temp: HFONT,
+    font_metric: HFONT,
+) {
+    let card_pen = CreatePen(PS_SOLID, 1, palette.border);
+    let card_brush = CreateSolidBrush(palette.card);
+    let old_pen = SelectObject(hdc, card_pen);
+    let old_brush = SelectObject(hdc, card_brush);
+
+    let _ = RoundRect(
+        hdc,
+        card_rect.left,
+        card_rect.top,
+        card_rect.right,
+        card_rect.bottom,
+        10,
+        10,
+    );
+
+    let _ = SelectObject(hdc, old_brush);
+    let _ = SelectObject(hdc, old_pen);
+    let _ = DeleteObject(card_brush);
+    let _ = DeleteObject(card_pen);
+
+    // Bounding Box lề trong an toàn: lùi 12px mỗi bên, tuyệt đối không tràn ra ngoài viền card
+    let inner_left = card_rect.left + 12;
+    let inner_right = card_rect.right - 12;
+    let card_h = card_rect.bottom - card_rect.top;
+
+    let pad_top = (card_h * 7 / 100).clamp(8, 16);
+    let line_h = 24;
+    let rem_space = card_h - 146 - (pad_top * 2);
+    let base_item_gap = (rem_space / 5).clamp(3, 16);
+
+    let y1 = card_rect.top + pad_top;
+    let rect_header = RECT { left: inner_left, top: y1, right: inner_right, bottom: y1 + line_h };
+
+    let y2 = rect_header.bottom + base_item_gap.min(6);
+    let rect_temp = RECT { left: inner_left, top: y2, right: inner_right, bottom: y2 + 40 };
+
+    let y3 = rect_temp.bottom + base_item_gap;
+    let rect_pwr = RECT { left: inner_left, top: y3, right: inner_right, bottom: y3 + line_h };
+
+    let y4 = rect_pwr.bottom + (base_item_gap / 2).max(2);
+    let rect_clk = RECT { left: inner_left, top: y4, right: inner_right, bottom: y4 + line_h };
+
+    let y5 = rect_clk.bottom + base_item_gap;
+    let rect_bar = RECT { left: inner_left, top: y5, right: inner_right, bottom: y5 + 10 };
+
+    let y6 = rect_bar.bottom + (base_item_gap / 2).max(4);
+    let rect_fan = RECT { left: inner_left, top: y6, right: inner_right, bottom: y6 + line_h };
+
+    // Dòng 1: Header (Font 11.5pt Bold, màu accent)
+    let _ = SelectObject(hdc, font_header);
+    draw_text_clipped(
+        hdc,
+        rect_header,
+        title,
+        accent_color,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+    );
+
+    // Dòng 2: Nhiệt độ (Font Segoe UI 28pt Bold, màu accent)
+    let _ = SelectObject(hdc, font_temp);
+    let temp_str = format!("{}°C", temp);
+    draw_text_clipped(
+        hdc,
+        rect_temp,
+        &temp_str,
+        accent_color,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+    );
+
+    // Dòng 3: Công suất (Font 10.5pt Semi-Bold, màu palette.text_sec)
+    let _ = SelectObject(hdc, font_metric);
+    let pwr = power_dw as f32 / 10.0;
+    let pwr_str = format!("⚡ Công suất: {:.1} W", pwr);
+    draw_text_clipped(
+        hdc,
+        rect_pwr,
+        &pwr_str,
+        palette.text_sec,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+    );
+
+    // Dòng 4: Xung nhịp (Font 10.5pt Semi-Bold, màu palette.text_sec)
+    let ghz = mhz as f32 / 1000.0;
+    let clk_str = format!("⏱ Xung nhịp: {:.2} GHz", ghz);
+    draw_text_clipped(
+        hdc,
+        rect_clk,
+        &clk_str,
+        palette.text_sec,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+    );
+
+    // Dòng 5: Thanh Bar quạt (chiều cao 9px, nền palette.bar_bg, thanh tiến trình accent)
+    let track_brush = CreateSolidBrush(palette.bar_bg);
+    FillRect(hdc, &rect_bar, track_brush);
+    let _ = DeleteObject(track_brush);
+
+    let track_w = rect_bar.right - rect_bar.left;
+    let fill_w = (track_w * (speed.min(100) as i32)) / 100;
+    if fill_w > 0 {
+        let fill_rect = RECT {
+            left: rect_bar.left,
+            top: rect_bar.top,
+            right: rect_bar.left + fill_w,
+            bottom: rect_bar.bottom,
+        };
+        let fill_brush = CreateSolidBrush(accent_color);
+        FillRect(hdc, &fill_rect, fill_brush);
+        let _ = DeleteObject(fill_brush);
+    }
+
+    // Dòng 6: Thông số quạt (Font 10.5pt Semi-Bold, màu palette.text_sec)
+    let fan_str = if rpm > 0 {
+        format!("🌀 Quạt: {}% ({} RPM)", speed, rpm)
+    } else {
+        format!("🌀 Quạt: {}%", speed)
+    };
+    draw_text_clipped(
+        hdc,
+        rect_fan,
+        &fan_str,
+        palette.text_sec,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+    );
 }
 
 /// Vẽ một nút bấm xúc giác với hiệu ứng nảy/lún và bo góc 10px
@@ -740,7 +896,7 @@ unsafe fn draw_tactile_button(
     SetTextColor(hdc, text_color);
     SetBkMode(hdc, TRANSPARENT);
 
-    let chosen_font = if btn.is_active || btn.is_danger {
+    let chosen_font = if btn.is_active || btn.is_danger || btn.id == ButtonId::ToggleEpp {
         font_bold
     } else {
         font_normal
@@ -753,7 +909,7 @@ unsafe fn draw_tactile_button(
         hdc,
         &mut wide_label,
         &mut text_rect,
-        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
     );
 
     let _ = SelectObject(hdc, old_font);
@@ -784,170 +940,80 @@ unsafe fn paint_dashboard(
 
     SetBkMode(hdc, TRANSPARENT);
 
-    // Khởi tạo các Font DPI-Aware sắc nét, kích thước chuẩn
-    let font_title = create_dpi_font(hwnd, 16, FW_BOLD.0 as i32);
-    let font_card_header = create_dpi_font(hwnd, 13, FW_BOLD.0 as i32);
-    let font_temp = create_dpi_font(hwnd, 34, FW_BOLD.0 as i32); // 34 pt Segoe UI Bold (to, sắc sảo, siêu rõ ràng)
-    let font_small = create_dpi_font(hwnd, 12, FW_SEMIBOLD.0 as i32); // 12 pt Semi-Bold
-    let font_body = create_dpi_font(hwnd, 13, FW_SEMIBOLD.0 as i32); // 13 pt Semi-Bold
-    let font_body_bold = create_dpi_font_tenth(hwnd, 135, FW_BOLD.0 as i32); // 13.5 pt Bold
+    // Khởi tạo các Font DPI-Aware sắc nét theo Tỷ lệ Vàng
+    let font_title = create_dpi_font(hwnd, 15, FW_BOLD.0 as i32);
+    let font_card_header = create_dpi_font_tenth(hwnd, 115, FW_BOLD.0 as i32); // 11.5pt Bold
+    let font_temp = create_dpi_font(hwnd, 28, FW_BOLD.0 as i32); // Segoe UI 28pt Bold
+    let font_sub_metric = create_dpi_font_tenth(hwnd, 105, FW_SEMIBOLD.0 as i32); // 10.5pt Semi-Bold
+    let font_btn_normal = create_dpi_font_tenth(hwnd, 115, FW_SEMIBOLD.0 as i32); // 11.5pt Semi-Bold
+    let font_btn_bold = create_dpi_font_tenth(hwnd, 115, FW_BOLD.0 as i32); // 11.5pt Bold
 
-    // 2. Header Bar (Y: 10..42)
+    // 2. Header Bar (Y: 10..40): Tiêu đề và thông báo hot-reload với clipping an toàn
+    let mut title_right = width - 155;
+    if snapshot.reload_flash_ticks > 0 && width >= 580 {
+        let flash_rect = RECT {
+            left: (width - 340).max(180),
+            top: 10,
+            right: width - 155,
+            bottom: 40,
+        };
+        let _ = SelectObject(hdc, font_btn_bold);
+        draw_text_clipped(
+            hdc,
+            flash_rect,
+            "✓ Đã tải lại cấu hình!",
+            rgb(76, 175, 80),
+            DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+        );
+        title_right = (flash_rect.left - 10).max(16);
+    }
+    let title_rect = RECT {
+        left: 16,
+        top: 10,
+        right: title_right.max(16),
+        bottom: 40,
+    };
     let old_font = SelectObject(hdc, font_title);
-    draw_text_line(hdc, 16, 12, "PREDATOR FAN CONTROL // DASHBOARD", palette.text);
-
-    // Thông báo trạng thái hot-reload config (nếu có nháy flash)
-    if snapshot.reload_flash_ticks > 0 {
-        let _ = SelectObject(hdc, font_body_bold);
-        let flash_x = (width - 16 - 120 - 180).max(16);
-        draw_text_line(hdc, flash_x, 14, "✓ Đã tải lại cấu hình!", rgb(76, 175, 80));
-    }
-
-    // 3. Telemetry Cards (CPU & GPU) từ Layout động
-    let cpu_card_rect = layout.card_cpu_rect;
-    let card_pen = CreatePen(PS_SOLID, 1, palette.border);
-    let card_brush = CreateSolidBrush(palette.card);
-    let old_pen = SelectObject(hdc, card_pen);
-    let old_brush = SelectObject(hdc, card_brush);
-
-    let _ = RoundRect(
+    draw_text_clipped(
         hdc,
-        cpu_card_rect.left,
-        cpu_card_rect.top,
-        cpu_card_rect.right,
-        cpu_card_rect.bottom,
-        10,
-        10,
+        title_rect,
+        "PREDATOR FAN CONTROL // DASHBOARD",
+        palette.text,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
     );
 
-    // --- GPU Card ---
-    let gpu_card_rect = layout.card_gpu_rect;
-    let _ = RoundRect(
+    // 3. Telemetry Cards (CPU & GPU) Multi-Line với Clipping Bounds an toàn
+    draw_telemetry_card(
         hdc,
-        gpu_card_rect.left,
-        gpu_card_rect.top,
-        gpu_card_rect.right,
-        gpu_card_rect.bottom,
-        10,
-        10,
+        layout.card_cpu_rect,
+        "CPU TELEMETRY",
+        snapshot.cpu_temp,
+        snapshot.cpu_power_dw,
+        snapshot.cpu_mhz,
+        snapshot.cpu_speed,
+        snapshot.cpu_rpm,
+        palette.cpu,
+        &palette,
+        font_card_header,
+        font_temp,
+        font_sub_metric,
     );
 
-    // Khôi phục pen & brush của card
-    let _ = SelectObject(hdc, old_brush);
-    let _ = SelectObject(hdc, old_pen);
-    let _ = DeleteObject(card_brush);
-    let _ = DeleteObject(card_pen);
-
-    let card_h = cpu_card_rect.bottom - cpu_card_rect.top;
-    let header_rel_y = (card_h * 7 / 100).clamp(10, 16);
-    let temp_rel_y = header_rel_y + (card_h * 15 / 100).clamp(20, 26);
-    let metric_rel_y = (card_h * 54 / 100).clamp(80, 130);
-    let track_rel_y = (card_h * 70 / 100).clamp(104, 168);
-    let fan_info_rel_y = track_rel_y + 16;
-
-    // --- Nội dung CPU Card ---
-    let _ = SelectObject(hdc, font_card_header);
-    draw_text_line(hdc, cpu_card_rect.left + 14, cpu_card_rect.top + header_rel_y, "CPU TELEMETRY", palette.cpu);
-
-    let _ = SelectObject(hdc, font_temp);
-    let cpu_temp_str = format!("{}°C", snapshot.cpu_temp);
-    draw_text_line(hdc, cpu_card_rect.left + 14, cpu_card_rect.top + temp_rel_y, &cpu_temp_str, palette.cpu);
-
-    // Dòng phụ: "Công suất: XX.X W | Xung nhịp: X.XX GHz"
-    let _ = SelectObject(hdc, font_small);
-    let cpu_pwr = snapshot.cpu_power_dw as f32 / 10.0;
-    let cpu_ghz = snapshot.cpu_mhz as f32 / 1000.0;
-    let cpu_card_w = cpu_card_rect.right - cpu_card_rect.left;
-    let cpu_metric_str = if cpu_card_w >= 235 {
-        format!("Công suất: {:.1} W | Xung nhịp: {:.2} GHz", cpu_pwr, cpu_ghz)
-    } else {
-        format!("Công suất: {:.1}W | {:.2}GHz", cpu_pwr, cpu_ghz)
-    };
-    draw_text_line(hdc, cpu_card_rect.left + 14, cpu_card_rect.top + metric_rel_y, &cpu_metric_str, palette.text_sec);
-
-    // Thanh Bar quạt CPU
-    let cpu_track_rect = RECT {
-        left: cpu_card_rect.left + 14,
-        top: cpu_card_rect.top + track_rel_y,
-        right: cpu_card_rect.right - 14,
-        bottom: cpu_card_rect.top + track_rel_y + 10,
-    };
-    let track_brush = CreateSolidBrush(palette.bar_bg);
-    FillRect(hdc, &cpu_track_rect, track_brush);
-
-    let cpu_track_w = cpu_track_rect.right - cpu_track_rect.left;
-    let cpu_fill_w = (cpu_track_w * (snapshot.cpu_speed.min(100) as i32)) / 100;
-    if cpu_fill_w > 0 {
-        let cpu_fill_rect = RECT {
-            left: cpu_track_rect.left,
-            top: cpu_track_rect.top,
-            right: cpu_track_rect.left + cpu_fill_w,
-            bottom: cpu_track_rect.bottom,
-        };
-        let cpu_fill_brush = CreateSolidBrush(palette.cpu);
-        FillRect(hdc, &cpu_fill_rect, cpu_fill_brush);
-        let _ = DeleteObject(cpu_fill_brush);
-    }
-
-    let _ = SelectObject(hdc, font_small);
-    let cpu_info = if snapshot.cpu_rpm > 0 {
-        format!("Quạt: {}% | {} RPM", snapshot.cpu_speed, snapshot.cpu_rpm)
-    } else {
-        format!("Quạt: {}%", snapshot.cpu_speed)
-    };
-    draw_text_line(hdc, cpu_card_rect.left + 14, cpu_card_rect.top + fan_info_rel_y, &cpu_info, palette.text_sec);
-
-    // --- Nội dung GPU Card ---
-    let _ = SelectObject(hdc, font_card_header);
-    draw_text_line(hdc, gpu_card_rect.left + 14, gpu_card_rect.top + header_rel_y, "GPU TELEMETRY", palette.gpu);
-
-    let _ = SelectObject(hdc, font_temp);
-    let gpu_temp_str = format!("{}°C", snapshot.gpu_temp);
-    draw_text_line(hdc, gpu_card_rect.left + 14, gpu_card_rect.top + temp_rel_y, &gpu_temp_str, palette.gpu);
-
-    // Dòng phụ: "Công suất: XX.X W | Xung nhịp: X.XX GHz"
-    let _ = SelectObject(hdc, font_small);
-    let gpu_pwr = snapshot.gpu_power_dw as f32 / 10.0;
-    let gpu_ghz = snapshot.gpu_mhz as f32 / 1000.0;
-    let gpu_card_w = gpu_card_rect.right - gpu_card_rect.left;
-    let gpu_metric_str = if gpu_card_w >= 235 {
-        format!("Công suất: {:.1} W | Xung nhịp: {:.2} GHz", gpu_pwr, gpu_ghz)
-    } else {
-        format!("Công suất: {:.1}W | {:.2}GHz", gpu_pwr, gpu_ghz)
-    };
-    draw_text_line(hdc, gpu_card_rect.left + 14, gpu_card_rect.top + metric_rel_y, &gpu_metric_str, palette.text_sec);
-
-    // Thanh Bar quạt GPU
-    let gpu_track_rect = RECT {
-        left: gpu_card_rect.left + 14,
-        top: gpu_card_rect.top + track_rel_y,
-        right: gpu_card_rect.right - 14,
-        bottom: gpu_card_rect.top + track_rel_y + 10,
-    };
-    FillRect(hdc, &gpu_track_rect, track_brush);
-    let _ = DeleteObject(track_brush);
-
-    let gpu_track_w = gpu_track_rect.right - gpu_track_rect.left;
-    let gpu_fill_w = (gpu_track_w * (snapshot.gpu_speed.min(100) as i32)) / 100;
-    if gpu_fill_w > 0 {
-        let gpu_fill_rect = RECT {
-            left: gpu_track_rect.left,
-            top: gpu_track_rect.top,
-            right: gpu_track_rect.left + gpu_fill_w,
-            bottom: gpu_track_rect.bottom,
-        };
-        let gpu_fill_brush = CreateSolidBrush(palette.gpu);
-        FillRect(hdc, &gpu_fill_rect, gpu_fill_brush);
-        let _ = DeleteObject(gpu_fill_brush);
-    }
-
-    let _ = SelectObject(hdc, font_small);
-    let gpu_info = if snapshot.gpu_rpm > 0 {
-        format!("Quạt: {}% | {} RPM", snapshot.gpu_speed, snapshot.gpu_rpm)
-    } else {
-        format!("Quạt: {}%", snapshot.gpu_speed)
-    };
-    draw_text_line(hdc, gpu_card_rect.left + 14, gpu_card_rect.top + fan_info_rel_y, &gpu_info, palette.text_sec);
+    draw_telemetry_card(
+        hdc,
+        layout.card_gpu_rect,
+        "GPU TELEMETRY",
+        snapshot.gpu_temp,
+        snapshot.gpu_power_dw,
+        snapshot.gpu_mhz,
+        snapshot.gpu_speed,
+        snapshot.gpu_rpm,
+        palette.gpu,
+        &palette,
+        font_card_header,
+        font_temp,
+        font_sub_metric,
+    );
 
     // 4. Panel Khóa nhiệt độ CPU (Smooth EPP) từ Layout động
     let epp_panel_rect = layout.epp_panel_rect;
@@ -971,30 +1037,35 @@ unsafe fn paint_dashboard(
     let _ = DeleteObject(epp_brush);
     let _ = DeleteObject(epp_pen);
 
-    let epp_h = epp_panel_rect.bottom - epp_panel_rect.top;
-    let epp_text_y = epp_panel_rect.top + (epp_h - 18) / 2;
-    let _ = SelectObject(hdc, font_body_bold);
-    draw_text_line(
+    // Tiêu đề EPP Governor với clipping không bao giờ đè nút Toggle:
+    let epp_text_rect = RECT {
+        left: 28,
+        top: epp_panel_rect.top,
+        right: (width - 16 - 135 - 8).max(28),
+        bottom: epp_panel_rect.bottom,
+    };
+    let _ = SelectObject(hdc, font_btn_bold);
+    draw_text_clipped(
         hdc,
-        epp_panel_rect.left + 14,
-        epp_text_y,
+        epp_text_rect,
         "Khóa nhiệt độ CPU (Smooth EPP Governor)",
         palette.text,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
     );
 
     // 5. Vẽ tất cả các nút bấm xúc giác
     for btn in &layout.buttons {
-        draw_tactile_button(hdc, btn, &palette, font_body, font_body_bold);
+        draw_tactile_button(hdc, btn, &palette, font_btn_normal, font_btn_bold);
     }
 
-    // 6. Dọn dẹp tài nguyên GDI chặt chẽ (Zero-Leak)
+    // 6. Dọn dẹp tài nguyên GDI triệt để (Zero GDI Leak)
     let _ = SelectObject(hdc, old_font);
     let _ = DeleteObject(font_title);
     let _ = DeleteObject(font_card_header);
     let _ = DeleteObject(font_temp);
-    let _ = DeleteObject(font_small);
-    let _ = DeleteObject(font_body);
-    let _ = DeleteObject(font_body_bold);
+    let _ = DeleteObject(font_sub_metric);
+    let _ = DeleteObject(font_btn_normal);
+    let _ = DeleteObject(font_btn_bold);
 }
 
 /// Window Procedure xử lý toàn bộ sự kiện của Dashboard Window
@@ -1181,8 +1252,8 @@ unsafe extern "system" fn dashboard_wndproc(
                 } else {
                     win_dpi as i32
                 };
-                mmi.ptMinTrackSize.x = MulDiv(520, dpi, 96);
-                mmi.ptMinTrackSize.y = MulDiv(450, dpi, 96);
+                mmi.ptMinTrackSize.x = MulDiv(560, dpi, 96);
+                mmi.ptMinTrackSize.y = MulDiv(460, dpi, 96);
             }
             LRESULT(0)
         }
@@ -1351,24 +1422,38 @@ mod tests {
 
         assert_eq!(buttons.len(), 9);
 
-        // Nút Turbo phải có state Pressed và is_active = true
+        // Nút Giao diện phải có chiều rộng 135px, neo ở w - 145, top: 10, bottom: 40
+        let theme_btn = buttons.iter().find(|b| b.id == ButtonId::ToggleTheme).unwrap();
+        assert_eq!(theme_btn.rect.left, 524 - 145);
+        assert_eq!(theme_btn.rect.right, 524 - 10);
+        assert_eq!(theme_btn.rect.right - theme_btn.rect.left, 135);
+        assert_eq!(theme_btn.rect.top, 10);
+        assert_eq!(theme_btn.rect.bottom, 40);
+
+        // Nút Turbo phải có state Pressed và is_active = true, chiều cao từ 38 đến 44 px
         let turbo_btn = buttons.iter().find(|b| b.id == ButtonId::ProfileTurbo).unwrap();
         assert_eq!(turbo_btn.state, ButtonState::Pressed);
         assert!(turbo_btn.is_active);
+        let turbo_h = turbo_btn.rect.bottom - turbo_btn.rect.top;
+        assert!((38..=44).contains(&turbo_h), "Turbo button height {} not in 38..44", turbo_h);
 
         // Nút Curve phải có state Normal và is_active = false
         let curve_btn = buttons.iter().find(|b| b.id == ButtonId::ProfileCurve).unwrap();
         assert_eq!(curve_btn.state, ButtonState::Normal);
         assert!(!curve_btn.is_active);
 
-        // Nút Toggle EPP phải có is_active = true và label chứa 80°C
+        // Nút Toggle EPP phải có is_active = true, label chứa 80°C, width 125px, height 32px
         let epp_btn = buttons.iter().find(|b| b.id == ButtonId::ToggleEpp).unwrap();
         assert!(epp_btn.is_active);
         assert!(epp_btn.label.contains("80°C"));
+        assert_eq!(epp_btn.rect.right - epp_btn.rect.left, 125);
+        assert_eq!(epp_btn.rect.bottom - epp_btn.rect.top, 32);
 
-        // Nút ExitApp phải có is_danger = true
+        // Nút ExitApp phải có is_danger = true, chiều cao từ 38 đến 44 px
         let exit_btn = buttons.iter().find(|b| b.id == ButtonId::ExitApp).unwrap();
         assert!(exit_btn.is_danger);
+        let exit_h = exit_btn.rect.bottom - exit_btn.rect.top;
+        assert!((38..=44).contains(&exit_h), "Exit button height {} not in 38..44", exit_h);
     }
 
     #[test]
@@ -1407,15 +1492,27 @@ mod tests {
             ..DashboardSnapshot::default()
         };
 
+        // Format cũ
         let cpu_pwr = snap.cpu_power_dw as f32 / 10.0;
         let cpu_ghz = snap.cpu_mhz as f32 / 1000.0;
         let str_full = format!("Công suất: {:.1} W | Xung nhịp: {:.2} GHz", cpu_pwr, cpu_ghz);
         assert_eq!(str_full, "Công suất: 42.8 W | Xung nhịp: 3.82 GHz");
 
+        // Format Multi-Line mới theo Kiến trúc Sư trưởng (Phase 1)
+        let pwr_str = format!("⚡ Công suất: {:.1} W", cpu_pwr);
+        assert_eq!(pwr_str, "⚡ Công suất: 42.8 W");
+        let clk_str = format!("⏱ Xung nhịp: {:.2} GHz", cpu_ghz);
+        assert_eq!(clk_str, "⏱ Xung nhịp: 3.82 GHz");
+
         let gpu_pwr = snap.gpu_power_dw as f32 / 10.0;
         let gpu_ghz = snap.gpu_mhz as f32 / 1000.0;
         let gpu_str_full = format!("Công suất: {:.1} W | Xung nhịp: {:.2} GHz", gpu_pwr, gpu_ghz);
         assert_eq!(gpu_str_full, "Công suất: 19.2 W | Xung nhịp: 2.25 GHz");
+
+        let gpu_pwr_str = format!("⚡ Công suất: {:.1} W", gpu_pwr);
+        assert_eq!(gpu_pwr_str, "⚡ Công suất: 19.2 W");
+        let gpu_clk_str = format!("⏱ Xung nhịp: {:.2} GHz", gpu_ghz);
+        assert_eq!(gpu_clk_str, "⏱ Xung nhịp: 2.25 GHz");
     }
 
     #[test]
@@ -1478,6 +1575,10 @@ mod tests {
                 assert!(btn.rect.left >= 0 && btn.rect.right <= w, "Nút {:?} vượt biên ngang", btn.id);
                 assert!(btn.rect.top >= 0 && btn.rect.bottom <= h, "Nút {:?} vượt biên dọc", btn.id);
             }
+
+            // 4. Kiểm tra Flex Layout: hàng nút cuối (ExitApp) chạm đúng đáy h - 16, không có khoảng trống đen hổng
+            let exit_btn = layout.buttons.iter().find(|b| b.id == ButtonId::ExitApp).unwrap();
+            assert_eq!(exit_btn.rect.bottom, h - 16, "Hàng nút đáy phải chạm đúng h - 16");
         }
     }
 

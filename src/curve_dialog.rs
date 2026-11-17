@@ -12,12 +12,12 @@ use std::sync::mpsc::Sender;
 use std::thread;
 
 use windows::core::{w, PCWSTR, Result};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, CreateSolidBrush, DeleteObject, GetDC, GetDeviceCaps, GetStockObject, ReleaseDC,
-    SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
-    FW_SEMIBOLD, HDC, HFONT, LOGPIXELSX, NULL_BRUSH, OUT_DEFAULT_PRECIS, TRANSPARENT,
-    VARIABLE_PITCH,
+    CreateFontW, CreateSolidBrush, DeleteObject, GetDC, GetDeviceCaps, GetSysColor,
+    GetSysColorBrush, InvalidateRect, ReleaseDC, SetBkColor, SetBkMode, SetTextColor,
+    UpdateWindow, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_BTNFACE, DEFAULT_CHARSET,
+    FW_SEMIBOLD, HDC, HFONT, LOGPIXELSX, OPAQUE, OUT_DEFAULT_PRECIS, VARIABLE_PITCH,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -114,6 +114,7 @@ struct DialogControls {
     gov_enabled_chk: HWND,
     gov_target_edit: HWND,
     telemetry_lbl: HWND,
+    last_telemetry: String,
     state: Option<Arc<crate::tray::TrayState>>,
     cmd_sender: Sender<TrayCommand>,
     font_main: HFONT,
@@ -141,6 +142,18 @@ pub fn open_curve_dialog(cmd_sender: Sender<TrayCommand>, state: Option<Arc<crat
             eprintln!("[CurveDialog] Lỗi khởi tạo cửa sổ cấu hình: {:?}", e);
         }
     });
+}
+
+/// Mở trực tiếp cửa sổ Curve Dialog ở chế độ độc lập (Standalone Preview / Testing)
+pub fn show_dialog_standalone() -> Result<()> {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    match run_dialog_window(tx, None) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            eprintln!("[ERROR] run_dialog_window failed: {:?}", e);
+            Err(e)
+        }
+    }
 }
 
 /// Hàm chạy vòng lặp thông điệp của cửa sổ cấu hình
@@ -174,18 +187,29 @@ fn run_dialog_window(cmd_sender: Sender<TrayCommand>, state: Option<Arc<crate::t
         let _ = ReleaseDC(HWND::default(), hdc_screen);
         let initial_dpi = if initial_dpi > 0 { initial_dpi } else { 96 };
 
-        let width = scale_dpi(560, initial_dpi);
-        let height = scale_dpi(590, initial_dpi);
+        let client_w = scale_dpi(740, initial_dpi);
+        let client_h = scale_dpi(550, initial_dpi);
+        let window_style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE;
+        let ex_style = WS_EX_APPWINDOW | WS_EX_TOPMOST;
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: client_w,
+            bottom: client_h,
+        };
+        let _ = AdjustWindowRectEx(&mut rect, window_style, false, ex_style);
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
         let screen_w = GetSystemMetrics(SM_CXSCREEN);
         let screen_h = GetSystemMetrics(SM_CYSCREEN);
         let pos_x = (screen_w - width) / 2;
         let pos_y = (screen_h - height) / 2;
 
         let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
+            ex_style,
             class_name,
             w!("Acer Predator - Cấu hình Fan Curve (Zero-Hysteresis)"),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE,
+            window_style,
             pos_x,
             pos_y,
             width,
@@ -214,6 +238,11 @@ fn run_dialog_window(cmd_sender: Sender<TrayCommand>, state: Option<Arc<crate::t
 
         // Đăng ký timer 500ms để cập nhật thông số telemetry liên tục
         let _ = SetTimer(hwnd, 101, 500, None);
+
+        let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
+        let _ = UpdateWindow(hwnd);
+        let _ = SetForegroundWindow(hwnd);
+        let _ = BringWindowToTop(hwnd);
 
         // Vòng lặp thông điệp
         let mut msg = MSG::default();
@@ -249,9 +278,9 @@ unsafe fn create_dialog_controls(
     let h_info = CreateWindowExW(
         WINDOW_EX_STYLE::default(),
         w!("STATIC"),
-        w!("Thiết lập nhiệt độ (°C) và tốc độ quạt (%). Quạt sẽ phản ứng tức thì không có độ trễ lọc."),
+        w!("Thiết lập nhiệt độ (°C) và tốc độ quạt (%). Phản ứng tức thì (Zero-Hysteresis)."),
         WS_CHILD | WS_VISIBLE,
-        s(15), s(12), s(525), s(24),
+        s(20), s(12), s(700), s(24),
         parent, HMENU::default(), hinstance, None,
     )?;
     SendMessageW(h_info, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
@@ -262,7 +291,7 @@ unsafe fn create_dialog_controls(
         w!("BUTTON"),
         w!(" Đường cong quạt CPU (CPU Fan Curve) "),
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(0x0007), // BS_GROUPBOX = 0x0007
-        s(15), s(38), s(520), s(146),
+        s(20), s(38), s(700), s(146),
         parent, HMENU::default(), hinstance, None,
     )?;
     SendMessageW(h_cpu_group, WM_SETFONT, WPARAM(font_btn.0 as usize), LPARAM(1));
@@ -279,7 +308,7 @@ unsafe fn create_dialog_controls(
             w!("STATIC"),
             PCWSTR(wide_label.as_ptr()),
             WS_CHILD | WS_VISIBLE,
-            s(32), y + s(2), s(60), s(22),
+            s(36), y + s(2), s(60), s(22),
             parent, HMENU::default(), hinstance, None,
         )?;
         SendMessageW(h_lbl, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
@@ -290,7 +319,7 @@ unsafe fn create_dialog_controls(
             w!("STATIC"),
             w!("Nhiệt độ:"),
             WS_CHILD | WS_VISIBLE,
-            s(98), y + s(2), s(65), s(22),
+            s(102), y + s(2), s(85), s(22),
             parent, HMENU::default(), hinstance, None,
         )?;
         SendMessageW(h_t_lbl, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
@@ -301,7 +330,7 @@ unsafe fn create_dialog_controls(
             w!("EDIT"),
             w!("0"),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WINDOW_STYLE(0x2000 | 0x0001), // ES_NUMBER | ES_CENTER
-            s(168), y, s(52), s(24),
+            s(192), y, s(52), s(24),
             parent, HMENU((ID_CPU_TEMP_BASE + i) as *mut _), hinstance, None,
         )?;
         SendMessageW(h_t_edit, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
@@ -312,7 +341,7 @@ unsafe fn create_dialog_controls(
             w!("STATIC"),
             w!("°C   -->   Tốc độ quạt:"),
             WS_CHILD | WS_VISIBLE,
-            s(228), y + s(2), s(138), s(22),
+            s(256), y + s(2), s(200), s(22),
             parent, HMENU::default(), hinstance, None,
         )?;
         SendMessageW(h_c_unit, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
@@ -323,7 +352,7 @@ unsafe fn create_dialog_controls(
             w!("EDIT"),
             w!("0"),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WINDOW_STYLE(0x2000 | 0x0001),
-            s(372), y, s(52), s(24),
+            s(466), y, s(52), s(24),
             parent, HMENU((ID_CPU_SPEED_BASE + i) as *mut _), hinstance, None,
         )?;
         SendMessageW(h_s_edit, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
@@ -334,7 +363,7 @@ unsafe fn create_dialog_controls(
             w!("STATIC"),
             w!("%"),
             WS_CHILD | WS_VISIBLE,
-            s(432), y + s(2), s(25), s(22),
+            s(526), y + s(2), s(30), s(22),
             parent, HMENU::default(), hinstance, None,
         )?;
         SendMessageW(h_pct, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
@@ -346,7 +375,7 @@ unsafe fn create_dialog_controls(
         w!("BUTTON"),
         w!(" Đường cong quạt GPU (GPU Fan Curve) "),
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(0x0007),
-        s(15), s(192), s(520), s(122),
+        s(20), s(192), s(700), s(122),
         parent, HMENU::default(), hinstance, None,
     )?;
     SendMessageW(h_gpu_group, WM_SETFONT, WPARAM(font_btn.0 as usize), LPARAM(1));
@@ -363,7 +392,7 @@ unsafe fn create_dialog_controls(
             w!("STATIC"),
             PCWSTR(wide_label.as_ptr()),
             WS_CHILD | WS_VISIBLE,
-            s(32), y + s(2), s(60), s(22),
+            s(36), y + s(2), s(60), s(22),
             parent, HMENU::default(), hinstance, None,
         )?;
         SendMessageW(h_lbl, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
@@ -373,7 +402,7 @@ unsafe fn create_dialog_controls(
             w!("STATIC"),
             w!("Nhiệt độ:"),
             WS_CHILD | WS_VISIBLE,
-            s(98), y + s(2), s(65), s(22),
+            s(102), y + s(2), s(85), s(22),
             parent, HMENU::default(), hinstance, None,
         )?;
         SendMessageW(h_t_lbl, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
@@ -383,7 +412,7 @@ unsafe fn create_dialog_controls(
             w!("EDIT"),
             w!("0"),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WINDOW_STYLE(0x2000 | 0x0001),
-            s(168), y, s(52), s(24),
+            s(192), y, s(52), s(24),
             parent, HMENU((ID_GPU_TEMP_BASE + i) as *mut _), hinstance, None,
         )?;
         SendMessageW(h_t_edit, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
@@ -394,7 +423,7 @@ unsafe fn create_dialog_controls(
             w!("STATIC"),
             w!("°C   -->   Tốc độ quạt:"),
             WS_CHILD | WS_VISIBLE,
-            s(228), y + s(2), s(138), s(22),
+            s(256), y + s(2), s(200), s(22),
             parent, HMENU::default(), hinstance, None,
         )?;
         SendMessageW(h_c_unit, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
@@ -404,7 +433,7 @@ unsafe fn create_dialog_controls(
             w!("EDIT"),
             w!("0"),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WINDOW_STYLE(0x2000 | 0x0001),
-            s(372), y, s(52), s(24),
+            s(466), y, s(52), s(24),
             parent, HMENU((ID_GPU_SPEED_BASE + i) as *mut _), hinstance, None,
         )?;
         SendMessageW(h_s_edit, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
@@ -415,7 +444,7 @@ unsafe fn create_dialog_controls(
             w!("STATIC"),
             w!("%"),
             WS_CHILD | WS_VISIBLE,
-            s(432), y + s(2), s(25), s(22),
+            s(526), y + s(2), s(30), s(22),
             parent, HMENU::default(), hinstance, None,
         )?;
         SendMessageW(h_pct, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
@@ -427,7 +456,7 @@ unsafe fn create_dialog_controls(
         w!("BUTTON"),
         w!(" Khóa nhiệt độ CPU mục tiêu (Smooth EPP Governor) "),
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(0x0007), // BS_GROUPBOX
-        s(15), s(322), s(520), s(84),
+        s(20), s(322), s(700), s(84),
         parent, HMENU::default(), hinstance, None,
     )?;
     SendMessageW(h_gov_group, WM_SETFONT, WPARAM(font_btn.0 as usize), LPARAM(1));
@@ -438,7 +467,7 @@ unsafe fn create_dialog_controls(
         w!("BUTTON"),
         w!("Kích hoạt Khóa nhiệt độ CPU (Intel Speed Shift EPP - Zero Stuttering)"),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(0x0003), // BS_AUTOCHECKBOX = 0x0003
-        s(32), s(346), s(485), s(24),
+        s(36), s(346), s(660), s(24),
         parent, HMENU(ID_CHK_GOVERNOR_ENABLED as *mut _), hinstance, None,
     )?;
     SendMessageW(h_gov_chk, WM_SETFONT, WPARAM(font_btn.0 as usize), LPARAM(1));
@@ -449,7 +478,7 @@ unsafe fn create_dialog_controls(
         w!("STATIC"),
         w!("Nhiệt độ CPU mục tiêu:"),
         WS_CHILD | WS_VISIBLE,
-        s(32), s(374), s(158), s(22),
+        s(36), s(374), s(210), s(22),
         parent, HMENU::default(), hinstance, None,
     )?;
     SendMessageW(h_gov_lbl, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
@@ -460,7 +489,7 @@ unsafe fn create_dialog_controls(
         w!("EDIT"),
         w!("80"),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WINDOW_STYLE(0x2000 | 0x0001), // ES_NUMBER | ES_CENTER
-        s(195), s(372), s(52), s(24),
+        s(252), s(372), s(52), s(24),
         parent, HMENU(ID_EDIT_GOVERNOR_TARGET as *mut _), hinstance, None,
     )?;
     SendMessageW(h_gov_edit, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
@@ -468,9 +497,9 @@ unsafe fn create_dialog_controls(
     let h_gov_hint = CreateWindowExW(
         WINDOW_EX_STYLE::default(),
         w!("STATIC"),
-        w!("°C   (Khuyên dùng: 75°C - 85°C. Mượt mà, không tắt Boost)"),
+        w!("°C   (Khuyên dùng: 75°C - 85°C. Mượt mà, giữ Boost)"),
         WS_CHILD | WS_VISIBLE,
-        s(255), s(374), s(270), s(22),
+        s(312), s(374), s(395), s(22),
         parent, HMENU::default(), hinstance, None,
     )?;
     SendMessageW(h_gov_hint, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
@@ -479,9 +508,9 @@ unsafe fn create_dialog_controls(
     let h_pre_lbl = CreateWindowExW(
         WINDOW_EX_STYLE::default(),
         w!("STATIC"),
-        w!("Mẫu thiết lập sẵn:"),
+        w!("Mẫu thiết lập:"),
         WS_CHILD | WS_VISIBLE,
-        s(15), s(418), s(130), s(24),
+        s(20), s(418), s(125), s(24),
         parent, HMENU::default(), hinstance, None,
     )?;
     SendMessageW(h_pre_lbl, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
@@ -491,7 +520,7 @@ unsafe fn create_dialog_controls(
         w!("BUTTON"),
         w!("Mặc định (Default)"),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-        s(150), s(414), s(122), s(28),
+        s(155), s(414), s(170), s(28),
         parent, HMENU(ID_BTN_PRESET_DEFAULT as *mut _), hinstance, None,
     )?;
     SendMessageW(btn_preset_def, WM_SETFONT, WPARAM(font_btn.0 as usize), LPARAM(1));
@@ -501,7 +530,7 @@ unsafe fn create_dialog_controls(
         w!("BUTTON"),
         w!("Tản nhiệt cao (Gaming)"),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-        s(280), s(414), s(142), s(28),
+        s(335), s(414), s(210), s(28),
         parent, HMENU(ID_BTN_PRESET_GAMING as *mut _), hinstance, None,
     )?;
     SendMessageW(btn_preset_game, WM_SETFONT, WPARAM(font_btn.0 as usize), LPARAM(1));
@@ -511,7 +540,7 @@ unsafe fn create_dialog_controls(
         w!("BUTTON"),
         w!("Yên tĩnh (Silent)"),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-        s(430), s(414), s(105), s(28),
+        s(555), s(414), s(165), s(28),
         parent, HMENU(ID_BTN_PRESET_SILENT as *mut _), hinstance, None,
     )?;
     SendMessageW(btn_preset_silent, WM_SETFONT, WPARAM(font_btn.0 as usize), LPARAM(1));
@@ -520,9 +549,9 @@ unsafe fn create_dialog_controls(
     let btn_save = CreateWindowExW(
         WINDOW_EX_STYLE::default(),
         w!("BUTTON"),
-        w!("Áp dụng & Lưu cấu hình"),
+        w!("Áp dụng && Lưu cấu hình"),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(0x0001), // BS_DEFPUSHBUTTON
-        s(15), s(452), s(195), s(34),
+        s(20), s(452), s(224), s(34),
         parent, HMENU(ID_BTN_SAVE_APPLY as *mut _), hinstance, None,
     )?;
     SendMessageW(btn_save, WM_SETFONT, WPARAM(font_btn.0 as usize), LPARAM(1));
@@ -532,7 +561,7 @@ unsafe fn create_dialog_controls(
         w!("BUTTON"),
         w!("Mở file config.toml"),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-        s(220), s(452), s(175), s(34),
+        s(258), s(452), s(224), s(34),
         parent, HMENU(ID_BTN_OPEN_CONFIG as *mut _), hinstance, None,
     )?;
     SendMessageW(btn_open, WM_SETFONT, WPARAM(font_btn.0 as usize), LPARAM(1));
@@ -542,7 +571,7 @@ unsafe fn create_dialog_controls(
         w!("BUTTON"),
         w!("Đóng"),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-        s(405), s(452), s(130), s(34),
+        s(496), s(452), s(224), s(34),
         parent, HMENU(ID_BTN_CLOSE as *mut _), hinstance, None,
     )?;
     SendMessageW(btn_close, WM_SETFONT, WPARAM(font_btn.0 as usize), LPARAM(1));
@@ -553,7 +582,7 @@ unsafe fn create_dialog_controls(
         w!("STATIC"),
         w!("Trạng thái phần cứng: Đang nạp cảm biến..."),
         WS_CHILD | WS_VISIBLE,
-        s(15), s(496), s(520), s(26),
+        s(20), s(498), s(700), s(26),
         parent, HMENU::default(), hinstance, None,
     )?;
     SendMessageW(h_telemetry, WM_SETFONT, WPARAM(font_main.0 as usize), LPARAM(1));
@@ -566,6 +595,7 @@ unsafe fn create_dialog_controls(
         gov_enabled_chk: h_gov_chk,
         gov_target_edit: h_gov_edit,
         telemetry_lbl: h_telemetry,
+        last_telemetry: String::new(),
         state,
         cmd_sender,
         font_main,
@@ -759,16 +789,17 @@ unsafe extern "system" fn dialog_wndproc(
             LRESULT(0)
         }
         WM_CTLCOLORSTATIC => {
-            // Đảm bảo chữ trên STATIC label rõ nét, nền đồng màu với dialog
+            // Đảm bảo chữ trên STATIC label rõ nét, xóa sạch nền cũ tránh lỗi vệt đen ma (text ghosting / smearing)
             let hdc = HDC(wparam.0 as *mut _);
-            SetBkMode(hdc, TRANSPARENT);
+            SetBkMode(hdc, OPAQUE);
+            SetBkColor(hdc, COLORREF(GetSysColor(COLOR_BTNFACE)));
             SetTextColor(hdc, COLORREF(0x001A1A1A));
-            let brush = GetStockObject(NULL_BRUSH);
+            let brush = GetSysColorBrush(COLOR_BTNFACE);
             LRESULT(brush.0 as isize)
         }
         WM_TIMER => {
             let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DialogControls;
-            if let Some(controls) = ptr.as_ref() {
+            if let Some(controls) = ptr.as_mut() {
                 if let Some(ref st) = controls.state {
                     let (cpu_t, cpu_s, gpu_t, gpu_s, cpu_rpm, gpu_rpm) = st.get_status_rpm();
                     let (gov_en, gov_tgt, gov_epp) = st.get_governor_info();
@@ -792,8 +823,12 @@ unsafe extern "system" fn dialog_wndproc(
                             cpu_t, cpu_s, gpu_t, gpu_s, gov_str
                         )
                     };
-                    let wide: Vec<u16> = status_str.encode_utf16().collect();
-                    let _ = SetWindowTextW(controls.telemetry_lbl, PCWSTR(wide.as_ptr()));
+                    if status_str != controls.last_telemetry {
+                        controls.last_telemetry = status_str.clone();
+                        let wide: Vec<u16> = status_str.encode_utf16().collect();
+                        let _ = InvalidateRect(controls.telemetry_lbl, None, true);
+                        let _ = SetWindowTextW(controls.telemetry_lbl, PCWSTR(wide.as_ptr()));
+                    }
                 }
             }
             LRESULT(0)
@@ -827,6 +862,13 @@ mod tests {
         // 96 DPI
         assert_eq!(scale_dpi(560, 96), 560);
         assert_eq!(scale_dpi(590, 96), 590);
+        assert_eq!(scale_dpi(640, 96), 640);
+        assert_eq!(scale_dpi(720, 96), 720);
+        assert_eq!(scale_dpi(740, 96), 740);
+        assert_eq!(scale_dpi(550, 96), 550);
+        assert_eq!(scale_dpi(600, 96), 600);
+        assert_eq!(scale_dpi(168, 96), 168);
+        assert_eq!(scale_dpi(200, 96), 200);
         assert_eq!(font_height_for_pt(12.0, 96), -16);
         assert_eq!(font_height_for_pt(12.5, 96), -17);
         assert_eq!(font_height_for_pt(13.0, 96), -17);
@@ -834,6 +876,13 @@ mod tests {
         // 120 DPI (125% scaling)
         assert_eq!(scale_dpi(560, 120), 700);
         assert_eq!(scale_dpi(590, 120), 738);
+        assert_eq!(scale_dpi(640, 120), 800);
+        assert_eq!(scale_dpi(720, 120), 900);
+        assert_eq!(scale_dpi(740, 120), 925);
+        assert_eq!(scale_dpi(550, 120), 688);
+        assert_eq!(scale_dpi(600, 120), 750);
+        assert_eq!(scale_dpi(168, 120), 210);
+        assert_eq!(scale_dpi(200, 120), 250);
         assert_eq!(font_height_for_pt(12.0, 120), -20);
         assert_eq!(font_height_for_pt(12.5, 120), -21);
         assert_eq!(font_height_for_pt(13.0, 120), -22);

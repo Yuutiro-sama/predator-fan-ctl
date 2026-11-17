@@ -261,7 +261,7 @@ fn run_chart_window(telemetry: Arc<Mutex<TelemetryHistory>>) -> Result<()> {
         let pos_y = (screen_h - height) / 2;
 
         let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
+            WS_EX_APPWINDOW | WS_EX_TOPMOST,
             class_name,
             w!("Acer Predator - Lịch sử phần cứng thời gian thực (1 Giờ)"),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,

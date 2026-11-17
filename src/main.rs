@@ -140,12 +140,22 @@ impl SingleInstanceGuard {
                     (h, exists)
                 }
                 Err(_) => {
-                    let local_name = format!("Local\\{}", name.strip_prefix("Global\\").unwrap_or(name));
-                    let wide_local: Vec<u16> = local_name.encode_utf16().chain(std::iter::once(0)).collect();
-                    SetLastError(WIN32_ERROR(0));
-                    let h = CreateMutexW(None, true, PCWSTR(wide_local.as_ptr()))?;
-                    let exists = GetLastError() == ERROR_ALREADY_EXISTS;
-                    (h, exists)
+                    let last_err = GetLastError();
+                    // ERROR_ACCESS_DENIED (5) chứng minh Mutex Global đã tồn tại do tiến trình quyền cao tạo
+                    if last_err.0 == 5 {
+                        (HANDLE::default(), true)
+                    } else {
+                        let local_name = format!("Local\\{}", name.strip_prefix("Global\\").unwrap_or(name));
+                        let wide_local: Vec<u16> = local_name.encode_utf16().chain(std::iter::once(0)).collect();
+                        SetLastError(WIN32_ERROR(0));
+                        match CreateMutexW(None, true, PCWSTR(wide_local.as_ptr())) {
+                            Ok(h) => {
+                                let exists = GetLastError() == ERROR_ALREADY_EXISTS;
+                                (h, exists)
+                            }
+                            Err(_) => (HANDLE::default(), GetLastError().0 == 5),
+                        }
+                    }
                 }
             }
         };
@@ -184,41 +194,57 @@ fn main() {
         let _ = AttachConsole(ATTACH_PARENT_PROCESS);
     }
 
+    if std::env::args().any(|a| a == "--curve-standalone") {
+        let _ = predator_fan_ctl::curve_dialog::show_dialog_standalone();
+        return;
+    }
+
     println!("==================================================================");
     println!("  Acer Predator Ultra-Light Fan Controller (Rust Win32 Native)   ");
     println!("==================================================================");
 
     // 2. Kiểm tra đơn phiên bản (Single-Instance Check)
     // Ngăn chặn hoàn toàn việc chạy 2 hoặc nhiều app cùng lúc làm lặp tray icon và tranh chấp thanh ghi
+    let find_tray = || -> Option<HWND> {
+        unsafe {
+            if let Ok(h) = FindWindowW(w!("PredatorFanTrayWindowClass"), w!("PredatorFanTray")) {
+                if !h.0.is_null() {
+                    return Some(h);
+                }
+            }
+            if let Ok(h) = FindWindowW(PCWSTR::null(), w!("PredatorFanTray")) {
+                if !h.0.is_null() {
+                    return Some(h);
+                }
+            }
+        }
+        None
+    };
+
+    let cmd = if std::env::args().any(|a| a == "--chart" || a == "-c") {
+        predator_fan_ctl::tray::IDM_SHOW_TEMP_CHART
+    } else if std::env::args().any(|a| a == "--curve") {
+        predator_fan_ctl::tray::IDM_CUSTOMIZE_CURVE
+    } else {
+        predator_fan_ctl::tray::IDM_OPEN_DASHBOARD
+    };
+
     let _single_instance_guard = match SingleInstanceGuard::acquire("Global\\AcerPredatorFanControlMutex") {
         Ok(guard) => {
             if guard.is_already_running() {
                 println!("[SINGLE-INSTANCE] Một phiên bản khác của Acer Predator Fan Control đã đang chạy!");
-                unsafe {
-                    let existing_hwnd = FindWindowW(
-                        w!("PredatorFanTrayWindowClass"),
-                        w!("PredatorFanTray"),
-                    ).or_else(|_| FindWindowW(PCWSTR::null(), w!("PredatorFanTray")));
-                    if let Ok(hwnd) = existing_hwnd {
-                        if !hwnd.0.is_null() {
-                            let cmd = if std::env::args().any(|a| a == "--chart" || a == "-c") {
-                                predator_fan_ctl::tray::IDM_SHOW_TEMP_CHART
-                            } else if std::env::args().any(|a| a == "--curve") {
-                                predator_fan_ctl::tray::IDM_CUSTOMIZE_CURVE
-                            } else {
-                                predator_fan_ctl::tray::IDM_OPEN_DASHBOARD
-                            };
-                            let _ = PostMessageW(
-                                hwnd,
-                                WM_COMMAND,
-                                WPARAM(cmd),
-                                LPARAM(0),
-                            );
+                for _ in 0..10 {
+                    if let Some(hwnd) = find_tray() {
+                        unsafe {
+                            let _ = PostMessageW(hwnd, WM_COMMAND, WPARAM(cmd), LPARAM(0));
                             let _ = SetForegroundWindow(hwnd);
-                            println!("[SINGLE-INSTANCE] Đã gửi lệnh kích hoạt giao diện (cmd: {cmd}) tới app đang chạy.");
                         }
+                        println!("[SINGLE-INSTANCE] Đã gửi lệnh kích hoạt giao diện (cmd: {cmd}) tới app đang chạy.");
+                        return;
                     }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
                 }
+                println!("[SINGLE-INSTANCE] Không tìm thấy cửa sổ khay để chuyển giao lệnh.");
                 return;
             }
             guard
