@@ -9,8 +9,8 @@
 
 // 3. PE Version Information (Hiển thị trong tab Details của File Properties & Task Manager)
 1 VERSIONINFO
-FILEVERSION 1,5,0,0
-PRODUCTVERSION 1,5,0,0
+FILEVERSION 1,5,1,0
+PRODUCTVERSION 1,5,1,0
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0x0L
 FILEOS 0x40004L
@@ -23,12 +23,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Predator Thermal Engineering"
             VALUE "FileDescription", "Predator Fan Controller (Win32 Native)"
-            VALUE "FileVersion", "1.5.0.0"
+            VALUE "FileVersion", "1.5.1.0"
             VALUE "InternalName", "predator-fan-ctl.exe"
             VALUE "LegalCopyright", "Copyright (C) 2026"
             VALUE "OriginalFilename", "predator-fan-ctl.exe"
             VALUE "ProductName", "Predator Fan Controller"
-            VALUE "ProductVersion", "1.5.0.0"
+            VALUE "ProductVersion", "1.5.1.0"
         END
     END
     BLOCK "VarFileInfo"

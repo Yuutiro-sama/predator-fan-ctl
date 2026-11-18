@@ -87,11 +87,11 @@ pub const fn default_target_temp() -> u32 {
 }
 
 pub const fn default_tolerance() -> u32 {
-    3
+    0
 }
 
 pub const fn default_max_epp() -> u32 {
-    50
+    90
 }
 
 pub const fn default_min_throttle() -> u32 {
@@ -244,8 +244,12 @@ impl Config {
         }
 
         self.thermal_governor.target_cpu_temp = self.thermal_governor.target_cpu_temp.clamp(50, 100);
-        self.thermal_governor.tolerance = self.thermal_governor.tolerance.clamp(1, 10);
-        self.thermal_governor.max_epp = self.thermal_governor.max_epp.clamp(10, 100);
+        self.thermal_governor.tolerance = self.thermal_governor.tolerance.clamp(0, 10);
+        if self.thermal_governor.max_epp < 85 {
+            self.thermal_governor.max_epp = 90; // Tự động nâng cấp trần an toàn lên 90 để đủ lực hãm tải nặng
+        } else {
+            self.thermal_governor.max_epp = self.thermal_governor.max_epp.clamp(10, 100);
+        }
         self.thermal_governor.min_throttle_pct = self.thermal_governor.min_throttle_pct.clamp(20, 100);
     }
 
@@ -342,8 +346,8 @@ mod tests {
         assert_eq!(cfg.gpu_curve.len(), 3);
         assert!(cfg.thermal_governor.enabled);
         assert_eq!(cfg.thermal_governor.target_cpu_temp, 80);
-        assert_eq!(cfg.thermal_governor.tolerance, 3);
-        assert_eq!(cfg.thermal_governor.max_epp, 50);
+        assert_eq!(cfg.thermal_governor.tolerance, 0);
+        assert_eq!(cfg.thermal_governor.max_epp, 90);
         assert_eq!(cfg.thermal_governor.min_throttle_pct, 55);
     }
 
@@ -360,7 +364,7 @@ min_throttle_pct = 10
         let cfg = Config::parse_str(toml_data).expect("Phải parse thành công");
         assert!(!cfg.thermal_governor.enabled);
         assert_eq!(cfg.thermal_governor.target_cpu_temp, 100); // clamped to 100
-        assert_eq!(cfg.thermal_governor.tolerance, 1); // clamped to 1
+        assert_eq!(cfg.thermal_governor.tolerance, 0); // clamped to 0..10
         assert_eq!(cfg.thermal_governor.max_epp, 100); // clamped to 100
         assert_eq!(cfg.thermal_governor.min_throttle_pct, 20); // clamped to 20
     }

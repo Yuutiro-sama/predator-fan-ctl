@@ -352,7 +352,7 @@ pub fn compute_dashboard_layout(
         right: w - 16,
         bottom: epp_y_bottom,
     };
-    let epp_btn_w = 125;
+    let epp_btn_w = 148;
     let epp_btn_h = 32.min(epp_h - 4);
     let epp_btn_top = epp_y_top + (epp_h - epp_btn_h) / 2;
     let epp_btn_right = w - 24;
@@ -364,7 +364,7 @@ pub fn compute_dashboard_layout(
         bottom: epp_btn_top + epp_btn_h,
     };
     let epp_label = if snapshot.governor_enabled {
-        format!("BẬT ({}°C)", snapshot.governor_target_temp)
+        format!("BẬT • {}°C", snapshot.governor_target_temp)
     } else {
         "TẮT".to_string()
     };
@@ -824,6 +824,137 @@ unsafe fn draw_telemetry_card(
     );
 }
 
+/// Vẽ cụm công tắc gạt xúc giác (Modern Tactile Pill Toggle Switch)
+/// Gồm nhãn trạng thái bên trái và thanh ray viên thuốc kèm bi gạt bên phải
+unsafe fn draw_tactile_toggle_switch(
+    hdc: HDC,
+    btn: &TactileButton,
+    palette: &ThemePalette,
+    font_normal: HFONT,
+    font_bold: HFONT,
+) {
+    let mut draw_rect = btn.rect;
+
+    // Hiệu ứng lún xúc giác nhẹ khi click (Pressed): dịch chuyển +1px ngang, +1px dọc
+    if btn.state == ButtonState::Pressed {
+        draw_rect.left += 1;
+        draw_rect.right += 1;
+        draw_rect.top += 1;
+        draw_rect.bottom += 1;
+    }
+
+    // 1. Kích thước & Tọa độ thanh ray (Pill Track): 50px width x 24px height, bo góc 24px
+    let track_w = 50;
+    let track_h = 24;
+    let track_right = draw_rect.right - 4;
+    let track_left = track_right - track_w;
+    let track_top = draw_rect.top + (draw_rect.bottom - draw_rect.top - track_h) / 2;
+    let track_bottom = track_top + track_h;
+    let track_rect = RECT {
+        left: track_left,
+        top: track_top,
+        right: track_right,
+        bottom: track_bottom,
+    };
+
+    // 2. Màu sắc thanh ray theo trạng thái BẬT/TẮT và Hover/Pressed
+    let (track_bg, track_border, border_width) = if btn.is_active {
+        match btn.state {
+            ButtonState::Hovered => (palette.cpu, rgb(180, 248, 255), 2),
+            ButtonState::Pressed => (palette.active_bg, palette.cpu, 2),
+            ButtonState::Normal => (palette.cpu, rgb(128, 242, 255), 1),
+        }
+    } else {
+        match btn.state {
+            ButtonState::Hovered => (palette.btn_hover, rgb(88, 96, 105), 1),
+            ButtonState::Pressed => (palette.btn_pressed, palette.border, 1),
+            ButtonState::Normal => (palette.btn_norm, palette.border, 1),
+        }
+    };
+
+    let track_pen = CreatePen(PS_SOLID, border_width, track_border);
+    let track_brush = CreateSolidBrush(track_bg);
+    let old_pen = SelectObject(hdc, track_pen);
+    let old_brush = SelectObject(hdc, track_brush);
+
+    // Bo góc 24px với height 24px tạo thành hình viên thuốc (Pill shape) hoàn hảo
+    let _ = RoundRect(
+        hdc,
+        track_rect.left,
+        track_rect.top,
+        track_rect.right,
+        track_rect.bottom,
+        24,
+        24,
+    );
+
+    let _ = SelectObject(hdc, old_brush);
+    let _ = SelectObject(hdc, old_pen);
+    let _ = DeleteObject(track_brush);
+    let _ = DeleteObject(track_pen);
+
+    // 3. Bi gạt (Thumb / Knob): đường kính 18px, lề trong 3px
+    let thumb_top = track_rect.top + 3;
+    let thumb_bottom = thumb_top + 18;
+
+    let (thumb_left, thumb_right, thumb_color) = if btn.is_active {
+        // Khi BẬT: Nằm lệch hẳn sang PHẢI (track.right - 3 - 18), màu trắng sáng nổi bật
+        let right = track_rect.right - 3;
+        let left = right - 18;
+        (left, right, rgb(255, 255, 255))
+    } else {
+        // Khi TẮT: Nằm lệch hẳn sang TRÁI (track.left + 3), màu xám trung tính #8B949E
+        let left = track_rect.left + 3;
+        let right = left + 18;
+        let col = match btn.state {
+            ButtonState::Hovered => rgb(170, 178, 188),
+            _ => rgb(139, 148, 158),
+        };
+        (left, right, col)
+    };
+
+    let thumb_pen = CreatePen(PS_SOLID, 1, thumb_color);
+    let thumb_brush = CreateSolidBrush(thumb_color);
+    let old_pen = SelectObject(hdc, thumb_pen);
+    let old_brush = SelectObject(hdc, thumb_brush);
+
+    let _ = Ellipse(hdc, thumb_left, thumb_top, thumb_right, thumb_bottom);
+
+    let _ = SelectObject(hdc, old_brush);
+    let _ = SelectObject(hdc, old_pen);
+    let _ = DeleteObject(thumb_brush);
+    let _ = DeleteObject(thumb_pen);
+
+    // 4. Nhãn trạng thái bên trái: BẬT • 75°C (Cyan, Bold) / TẮT (Xám chìm, Normal)
+    let label_rect = RECT {
+        left: draw_rect.left + 2,
+        top: draw_rect.top,
+        right: track_rect.left - 8,
+        bottom: draw_rect.bottom,
+    };
+
+    let (text_color, chosen_font) = if btn.is_active {
+        (palette.cpu, font_bold)
+    } else {
+        (palette.text_sec, font_normal)
+    };
+
+    SetTextColor(hdc, text_color);
+    SetBkMode(hdc, TRANSPARENT);
+    let old_font = SelectObject(hdc, chosen_font);
+
+    let mut mut_label_rect = label_rect;
+    let mut wide_label: Vec<u16> = btn.label.encode_utf16().collect();
+    let _ = DrawTextW(
+        hdc,
+        &mut wide_label,
+        &mut mut_label_rect,
+        DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+    );
+
+    let _ = SelectObject(hdc, old_font);
+}
+
 /// Vẽ một nút bấm xúc giác với hiệu ứng nảy/lún và bo góc 10px
 unsafe fn draw_tactile_button(
     hdc: HDC,
@@ -832,6 +963,11 @@ unsafe fn draw_tactile_button(
     font_normal: HFONT,
     font_bold: HFONT,
 ) {
+    if btn.id == ButtonId::ToggleEpp {
+        draw_tactile_toggle_switch(hdc, btn, palette, font_normal, font_bold);
+        return;
+    }
+
     let mut draw_rect = btn.rect;
 
     // Hiệu ứng lún xúc giác (Tactile Sink): dịch chuyển phải +1px, xuống dưới +2px
@@ -1038,10 +1174,17 @@ unsafe fn paint_dashboard(
     let _ = DeleteObject(epp_pen);
 
     // Tiêu đề EPP Governor với clipping không bao giờ đè nút Toggle:
+    let epp_text_right = layout
+        .buttons
+        .iter()
+        .find(|b| b.id == ButtonId::ToggleEpp)
+        .map(|b| b.rect.left - 12)
+        .unwrap_or(width - 170);
+
     let epp_text_rect = RECT {
         left: 28,
         top: epp_panel_rect.top,
-        right: (width - 16 - 135 - 8).max(28),
+        right: epp_text_right.max(28),
         bottom: epp_panel_rect.bottom,
     };
     let _ = SelectObject(hdc, font_btn_bold);
@@ -1053,9 +1196,13 @@ unsafe fn paint_dashboard(
         DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
     );
 
-    // 5. Vẽ tất cả các nút bấm xúc giác
+    // 5. Vẽ tất cả các nút bấm xúc giác và công tắc gạt
     for btn in &layout.buttons {
-        draw_tactile_button(hdc, btn, &palette, font_btn_normal, font_btn_bold);
+        if btn.id == ButtonId::ToggleEpp {
+            draw_tactile_toggle_switch(hdc, btn, &palette, font_btn_normal, font_btn_bold);
+        } else {
+            draw_tactile_button(hdc, btn, &palette, font_btn_normal, font_btn_bold);
+        }
     }
 
     // 6. Dọn dẹp tài nguyên GDI triệt để (Zero GDI Leak)
@@ -1241,6 +1388,19 @@ unsafe extern "system" fn dashboard_wndproc(
                 let _ = InvalidateRect(hwnd, None, false);
             }
             LRESULT(0)
+        }
+        WM_SETCURSOR => {
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DashboardWindowState;
+            if let Some(state) = ptr.as_ref() {
+                if state.hovered_btn.is_some() {
+                    let hand_cursor = LoadCursorW(None, IDC_HAND).unwrap_or_default();
+                    if !hand_cursor.0.is_null() {
+                        let _ = SetCursor(hand_cursor);
+                        return LRESULT(1);
+                    }
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_GETMINMAXINFO => {
             let p_mmi = lparam.0 as *mut MINMAXINFO;
@@ -1442,11 +1602,11 @@ mod tests {
         assert_eq!(curve_btn.state, ButtonState::Normal);
         assert!(!curve_btn.is_active);
 
-        // Nút Toggle EPP phải có is_active = true, label chứa 80°C, width 125px, height 32px
+        // Nút Toggle EPP (Pill Toggle Switch) phải có is_active = true, label chứa 80°C, width 148px, height 32px
         let epp_btn = buttons.iter().find(|b| b.id == ButtonId::ToggleEpp).unwrap();
         assert!(epp_btn.is_active);
         assert!(epp_btn.label.contains("80°C"));
-        assert_eq!(epp_btn.rect.right - epp_btn.rect.left, 125);
+        assert_eq!(epp_btn.rect.right - epp_btn.rect.left, 148);
         assert_eq!(epp_btn.rect.bottom - epp_btn.rect.top, 32);
 
         // Nút ExitApp phải có is_danger = true, chiều cao từ 38 đến 44 px
@@ -1454,6 +1614,53 @@ mod tests {
         assert!(exit_btn.is_danger);
         let exit_h = exit_btn.rect.bottom - exit_btn.rect.top;
         assert!((38..=44).contains(&exit_h), "Exit button height {} not in 38..44", exit_h);
+    }
+
+    #[test]
+    fn test_tactile_toggle_switch_layout_and_states() {
+        let mut snap_on = DashboardSnapshot::default();
+        snap_on.governor_enabled = true;
+        snap_on.governor_target_temp = 75;
+
+        let mut snap_off = DashboardSnapshot::default();
+        snap_off.governor_enabled = false;
+        snap_off.governor_target_temp = 75;
+
+        // 1. Kiểm tra trạng thái BẬT (ON)
+        let btns_on = compute_button_layout(600, 500, &snap_on, AppTheme::Dark, None, None);
+        let toggle_on = btns_on.iter().find(|b| b.id == ButtonId::ToggleEpp).unwrap();
+        assert!(toggle_on.is_active);
+        assert_eq!(toggle_on.label, "BẬT • 75°C");
+        assert_eq!(toggle_on.rect.right - toggle_on.rect.left, 148);
+        assert_eq!(toggle_on.rect.bottom - toggle_on.rect.top, 32);
+
+        // 2. Kiểm tra trạng thái TẮT (OFF)
+        let btns_off = compute_button_layout(600, 500, &snap_off, AppTheme::Dark, None, None);
+        let toggle_off = btns_off.iter().find(|b| b.id == ButtonId::ToggleEpp).unwrap();
+        assert!(!toggle_off.is_active);
+        assert_eq!(toggle_off.label, "TẮT");
+        assert_eq!(toggle_off.rect.right - toggle_off.rect.left, 148);
+        assert_eq!(toggle_off.rect.bottom - toggle_off.rect.top, 32);
+
+        // 3. Kiểm tra Hit-testing bao phủ toàn bộ cụm: nhãn chữ bên trái và thanh gạt bên phải
+        // Điểm ở góc trái (vùng nhãn chữ)
+        let pt_label = POINT { x: toggle_on.rect.left + 15, y: toggle_on.rect.top + 16 };
+        assert_eq!(find_button_at(&btns_on, pt_label), Some(ButtonId::ToggleEpp));
+
+        // Điểm ở góc phải (vùng thanh gạt / track)
+        let pt_track = POINT { x: toggle_on.rect.right - 15, y: toggle_on.rect.top + 16 };
+        assert_eq!(find_button_at(&btns_on, pt_track), Some(ButtonId::ToggleEpp));
+
+        // Điểm ở vị trí chính giữa
+        let pt_center = POINT {
+            x: (toggle_on.rect.left + toggle_on.rect.right) / 2,
+            y: toggle_on.rect.top + 16,
+        };
+        assert_eq!(find_button_at(&btns_on, pt_center), Some(ButtonId::ToggleEpp));
+
+        // Điểm ngay sát ngoài biên phải (không trúng)
+        let pt_outside = POINT { x: toggle_on.rect.right + 2, y: toggle_on.rect.top + 16 };
+        assert_ne!(find_button_at(&btns_on, pt_outside), Some(ButtonId::ToggleEpp));
     }
 
     #[test]

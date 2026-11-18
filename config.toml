@@ -13,9 +13,9 @@ gpu_fan_speed_reg = 0x3A
 # Khóa nhiệt độ CPU mục tiêu (Dynamic Smooth EPP Thermal Governor - Zero Stuttering)
 [thermal_governor]
 enabled = true
-target_cpu_temp = 80
-tolerance = 3
-max_epp = 50
+target_cpu_temp = 75
+tolerance = 0
+max_epp = 90
 min_throttle_pct = 55
 
 # Fan curve phản ứng tức thì (Zero-Hysteresis): [Nhiệt độ (°C), Tốc độ quạt (%)]
