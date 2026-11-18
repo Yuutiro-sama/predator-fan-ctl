@@ -257,7 +257,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "predator-fan-ctl"
-version = "1.5.0"
+version = "1.5.2"
 dependencies = [
  "embed-resource",
  "serde",

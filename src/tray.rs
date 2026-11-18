@@ -103,6 +103,7 @@ pub struct TrayState {
     pub cpu_speed: AtomicU8,
     pub gpu_temp: AtomicU32,
     pub gpu_speed: AtomicU8,
+    pub system_temp: AtomicU32,
     pub cpu_rpm: AtomicU32,
     pub gpu_rpm: AtomicU32,
     pub active_profile: AtomicU8,
@@ -122,6 +123,7 @@ impl Default for TrayState {
             cpu_speed: AtomicU8::new(0),
             gpu_temp: AtomicU32::new(0),
             gpu_speed: AtomicU8::new(0),
+            system_temp: AtomicU32::new(0),
             cpu_rpm: AtomicU32::new(0),
             gpu_rpm: AtomicU32::new(0),
             active_profile: AtomicU8::new(FanProfile::ActiveCurve.to_u8()),
@@ -234,19 +236,41 @@ impl TrayState {
         )
     }
 
-    /// Định dạng chuỗi tooltip hiển thị chi tiết: CPU: XX°C XX.XW X.XXGHz | GPU: XX°C XX.XW X.XXGHz
+    pub fn update_system_temp(&self, val: u32) {
+        self.system_temp.store(val, Ordering::Relaxed);
+    }
+
+    pub fn get_system_temp(&self) -> u32 {
+        self.system_temp.load(Ordering::Relaxed)
+    }
+
+    /// Định dạng chuỗi tooltip hiển thị chi tiết: CPU: XX°C XX.XW X.XXGHz | GPU: XX°C XX.XW X.XXGHz (| Sys: ZZ°C)
     pub fn format_tooltip(&self) -> String {
         let (cpu_temp, _cpu_speed, gpu_temp, _gpu_speed) = self.get_status();
         let (cpu_power_dw, gpu_power_dw, cpu_mhz, gpu_mhz) = self.get_metrics();
-        format!(
-            "CPU: {}°C {:.1}W {:.2}GHz | GPU: {}°C {:.1}W {:.2}GHz",
-            cpu_temp,
-            cpu_power_dw as f32 / 10.0,
-            cpu_mhz as f32 / 1000.0,
-            gpu_temp,
-            gpu_power_dw as f32 / 10.0,
-            gpu_mhz as f32 / 1000.0,
-        )
+        let sys_temp = self.get_system_temp();
+        if sys_temp > 0 {
+            format!(
+                "CPU: {}°C {:.1}W {:.2}GHz | GPU: {}°C {:.1}W {:.2}GHz | Sys: {}°C",
+                cpu_temp,
+                cpu_power_dw as f32 / 10.0,
+                cpu_mhz as f32 / 1000.0,
+                gpu_temp,
+                gpu_power_dw as f32 / 10.0,
+                gpu_mhz as f32 / 1000.0,
+                sys_temp,
+            )
+        } else {
+            format!(
+                "CPU: {}°C {:.1}W {:.2}GHz | GPU: {}°C {:.1}W {:.2}GHz",
+                cpu_temp,
+                cpu_power_dw as f32 / 10.0,
+                cpu_mhz as f32 / 1000.0,
+                gpu_temp,
+                gpu_power_dw as f32 / 10.0,
+                gpu_mhz as f32 / 1000.0,
+            )
+        }
     }
 }
 
@@ -317,6 +341,14 @@ impl TrayHandle {
 
     pub fn get_governor_info(&self) -> (bool, u32, u32) {
         self.state.get_governor_info()
+    }
+
+    pub fn update_system_temp(&self, val: u32) {
+        self.state.update_system_temp(val);
+    }
+
+    pub fn get_system_temp(&self) -> u32 {
+        self.state.get_system_temp()
     }
 
     /// Cập nhật tooltip khay hệ thống (hiển thị khi rê chuột vào icon)
@@ -990,6 +1022,13 @@ mod tests {
         // Kiểm tra format_tooltip: "CPU: XX°C XX.XW X.XXGHz | GPU: XX°C XX.XW X.XXGHz"
         let tooltip = state.format_tooltip();
         assert_eq!(tooltip, "CPU: 60°C 45.0W 4.10GHz | GPU: 65°C 21.0W 2.30GHz");
+
+        // Kiểm tra System Temp và format_tooltip có Sys
+        assert_eq!(state.get_system_temp(), 0);
+        state.update_system_temp(52);
+        assert_eq!(state.get_system_temp(), 52);
+        let tooltip_with_sys = state.format_tooltip();
+        assert_eq!(tooltip_with_sys, "CPU: 60°C 45.0W 4.10GHz | GPU: 65°C 21.0W 2.30GHz | Sys: 52°C");
     }
 
     #[test]

@@ -37,6 +37,8 @@ pub struct TelemetrySample {
     pub cpu_temp: u8,
     /// Nhiệt độ GPU (°C).
     pub gpu_temp: u8,
+    /// Nhiệt độ Bo mạch / Hệ thống (°C).
+    pub system_temp: u8,
     /// Tốc độ quạt CPU (%).
     pub cpu_fan_pct: u8,
     /// Tốc độ quạt GPU (%).
@@ -80,7 +82,7 @@ impl TelemetrySample {
 /// Thống kê chi tiết dữ liệu nhiệt độ, công suất và xung nhịp trong bộ đệm hiện tại.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct TelemetryStats {
-    // Nhiệt độ (°C)
+    // Nhiệt độ CPU & GPU (°C)
     pub cpu_min: u8,
     pub cpu_max: u8,
     pub cpu_avg: f32,
@@ -89,6 +91,11 @@ pub struct TelemetryStats {
     pub gpu_avg: f32,
     pub cpu_current: u8,
     pub gpu_current: u8,
+    // Nhiệt độ Bo mạch / Hệ thống (°C)
+    pub system_min: u8,
+    pub system_max: u8,
+    pub system_avg: f32,
+    pub system_current: u8,
     // Công suất (deciwatts: 0.1 W)
     pub cpu_power_min: u16,
     pub cpu_power_max: u16,
@@ -146,6 +153,7 @@ impl TelemetryHistory {
         &mut self,
         cpu_temp: u8,
         gpu_temp: u8,
+        system_temp: u8,
         cpu_fan: u8,
         gpu_fan: u8,
         cpu_power_dw: u16,
@@ -158,6 +166,7 @@ impl TelemetryHistory {
             timestamp_secs,
             cpu_temp,
             gpu_temp,
+            system_temp,
             cpu_fan,
             gpu_fan,
             cpu_power_dw,
@@ -173,6 +182,7 @@ impl TelemetryHistory {
         timestamp_secs: u64,
         cpu_temp: u8,
         gpu_temp: u8,
+        system_temp: u8,
         cpu_fan: u8,
         gpu_fan: u8,
         cpu_power_dw: u16,
@@ -184,6 +194,7 @@ impl TelemetryHistory {
             timestamp_secs,
             cpu_temp,
             gpu_temp,
+            system_temp,
             cpu_fan_pct: cpu_fan,
             gpu_fan_pct: gpu_fan,
             cpu_power_dw,
@@ -270,6 +281,11 @@ impl TelemetryHistory {
         let mut gpu_max = u8::MIN;
         let mut gpu_sum: u64 = 0;
 
+        let mut sys_min = u8::MAX;
+        let mut sys_max = u8::MIN;
+        let mut sys_sum: u64 = 0;
+        let mut sys_valid_count: usize = 0;
+
         let mut cpu_pwr_min = u16::MAX;
         let mut cpu_pwr_max = u16::MIN;
         let mut cpu_pwr_sum: u64 = 0;
@@ -297,6 +313,13 @@ impl TelemetryHistory {
             gpu_max = gpu_max.max(sample.gpu_temp);
             gpu_sum += sample.gpu_temp as u64;
 
+            if sample.system_temp > 0 {
+                sys_min = sys_min.min(sample.system_temp);
+                sys_max = sys_max.max(sample.system_temp);
+                sys_sum += sample.system_temp as u64;
+                sys_valid_count += 1;
+            }
+
             cpu_pwr_min = cpu_pwr_min.min(sample.cpu_power_dw);
             cpu_pwr_max = cpu_pwr_max.max(sample.cpu_power_dw);
             cpu_pwr_sum += sample.cpu_power_dw as u64;
@@ -314,6 +337,12 @@ impl TelemetryHistory {
             gpu_mhz_sum += sample.gpu_mhz as u64;
         }
 
+        let (system_min, system_max, system_avg) = if sys_valid_count > 0 {
+            (sys_min, sys_max, sys_sum as f32 / sys_valid_count as f32)
+        } else {
+            (0, 0, 0.0)
+        };
+
         Some(TelemetryStats {
             cpu_min,
             cpu_max,
@@ -323,6 +352,10 @@ impl TelemetryHistory {
             gpu_avg: gpu_sum as f32 / count as f32,
             cpu_current: current_sample.cpu_temp,
             gpu_current: current_sample.gpu_temp,
+            system_min,
+            system_max,
+            system_avg,
+            system_current: current_sample.system_temp,
             cpu_power_min: cpu_pwr_min,
             cpu_power_max: cpu_pwr_max,
             cpu_power_avg: cpu_pwr_sum as f32 / count as f32,
@@ -365,9 +398,9 @@ mod tests {
         assert_eq!(history.len(), 0);
         assert!(history.is_empty());
 
-        history.push_with_timestamp(10, 45, 40, 30, 30, 420, 200, 3800, 2100);
-        history.push_with_timestamp(11, 48, 42, 35, 32, 450, 220, 4000, 2200);
-        history.push_with_timestamp(12, 52, 44, 40, 35, 550, 300, 4500, 2300);
+        history.push_with_timestamp(10, 45, 40, 50, 30, 30, 420, 200, 3800, 2100);
+        history.push_with_timestamp(11, 48, 42, 52, 35, 32, 450, 220, 4000, 2200);
+        history.push_with_timestamp(12, 52, 44, 55, 40, 35, 550, 300, 4500, 2300);
 
         assert_eq!(history.len(), 3);
         assert!(!history.is_empty());
@@ -378,6 +411,7 @@ mod tests {
         assert_eq!(samples[0].timestamp_secs, 10);
         assert_eq!(samples[0].cpu_temp, 45);
         assert_eq!(samples[0].gpu_temp, 40);
+        assert_eq!(samples[0].system_temp, 50);
         assert_eq!(samples[0].cpu_power_dw, 420);
         assert_eq!(samples[0].gpu_power_dw, 200);
         assert_eq!(samples[0].cpu_mhz, 3800);
@@ -386,10 +420,12 @@ mod tests {
         assert_eq!(samples[1].timestamp_secs, 11);
         assert_eq!(samples[1].cpu_temp, 48);
         assert_eq!(samples[1].gpu_temp, 42);
+        assert_eq!(samples[1].system_temp, 52);
 
         assert_eq!(samples[2].timestamp_secs, 12);
         assert_eq!(samples[2].cpu_temp, 52);
         assert_eq!(samples[2].gpu_temp, 44);
+        assert_eq!(samples[2].system_temp, 55);
 
         let current = history.current().expect("current sample must exist");
         assert_eq!(current, samples[2]);
@@ -403,6 +439,7 @@ mod tests {
         for i in 0..5000u64 {
             let cpu_temp = ((i % 50) + 40) as u8;
             let gpu_temp = ((i % 40) + 35) as u8;
+            let system_temp = ((i % 30) + 45) as u8;
             let cpu_power_dw = ((i % 500) + 200) as u16;
             let gpu_power_dw = ((i % 400) + 100) as u16;
             let cpu_mhz = ((i % 2000) + 2500) as u16;
@@ -411,6 +448,7 @@ mod tests {
                 i,
                 cpu_temp,
                 gpu_temp,
+                system_temp,
                 50,
                 50,
                 cpu_power_dw,
@@ -454,13 +492,13 @@ mod tests {
     fn test_stats_calculation() {
         let mut history = TelemetryHistory::new();
 
-        history.push_with_timestamp(1, 40, 30, 20, 20, 300, 100, 3000, 1500);
-        history.push_with_timestamp(2, 50, 45, 30, 30, 450, 200, 4000, 2000);
-        history.push_with_timestamp(3, 60, 60, 40, 40, 600, 300, 5000, 2500);
+        history.push_with_timestamp(1, 40, 30, 45, 20, 20, 300, 100, 3000, 1500);
+        history.push_with_timestamp(2, 50, 45, 50, 30, 30, 450, 200, 4000, 2000);
+        history.push_with_timestamp(3, 60, 60, 55, 40, 40, 600, 300, 5000, 2500);
 
         let stats = history.stats().expect("stats should be calculated");
 
-        // Nhiệt độ
+        // Nhiệt độ CPU & GPU
         assert_eq!(stats.cpu_min, 40);
         assert_eq!(stats.cpu_max, 60);
         assert!((stats.cpu_avg - 50.0).abs() < 1e-4);
@@ -470,6 +508,12 @@ mod tests {
         assert_eq!(stats.gpu_max, 60);
         assert!((stats.gpu_avg - 45.0).abs() < 1e-4);
         assert_eq!(stats.gpu_current, 60);
+
+        // Nhiệt độ Mainboard / System
+        assert_eq!(stats.system_min, 45);
+        assert_eq!(stats.system_max, 55);
+        assert!((stats.system_avg - 50.0).abs() < 1e-4);
+        assert_eq!(stats.system_current, 55);
 
         // Công suất
         assert_eq!(stats.cpu_power_min, 300);
@@ -495,11 +539,31 @@ mod tests {
     }
 
     #[test]
+    fn test_stats_system_temp_ignores_zero_in_min() {
+        let mut history = TelemetryHistory::new();
+
+        // Mẫu 1 có system_temp = 0 (cảm biến tạm thời N/A)
+        history.push_with_timestamp(1, 40, 30, 0, 20, 20, 300, 100, 3000, 1500);
+        // Mẫu 2 có system_temp = 50
+        history.push_with_timestamp(2, 50, 45, 50, 30, 30, 450, 200, 4000, 2000);
+        // Mẫu 3 có system_temp = 60
+        history.push_with_timestamp(3, 60, 60, 60, 40, 40, 600, 300, 5000, 2500);
+
+        let stats = history.stats().expect("stats should be calculated");
+        // system_min phải là 50 (bỏ qua giá trị 0)
+        assert_eq!(stats.system_min, 50);
+        assert_eq!(stats.system_max, 60);
+        assert!((stats.system_avg - 55.0).abs() < 1e-4);
+        assert_eq!(stats.system_current, 60);
+    }
+
+    #[test]
     fn test_helpers() {
         let sample = TelemetrySample {
             timestamp_secs: 100,
             cpu_temp: 70,
             gpu_temp: 65,
+            system_temp: 50,
             cpu_fan_pct: 55,
             gpu_fan_pct: 50,
             cpu_power_dw: 428, // 42.8 W
@@ -547,8 +611,8 @@ mod tests {
         let mut history = TelemetryHistory::new();
 
         // 1. Dưới dung lượng tối đa
-        history.push_with_timestamp(1, 40, 40, 20, 20, 300, 100, 3000, 1500);
-        history.push_with_timestamp(2, 45, 45, 25, 25, 350, 120, 3200, 1600);
+        history.push_with_timestamp(1, 40, 40, 45, 20, 20, 300, 100, 3000, 1500);
+        history.push_with_timestamp(2, 45, 45, 48, 25, 25, 350, 120, 3200, 1600);
         let (s1, s2) = history.as_slices();
         assert_eq!(s1.len(), 2);
         assert_eq!(s2.len(), 0);
@@ -557,14 +621,14 @@ mod tests {
 
         // 2. Điền đầy đúng 3600 mẫu
         for i in 2..3600u64 {
-            history.push_with_timestamp(i + 1, 50, 50, 30, 30, 400, 150, 3500, 1800);
+            history.push_with_timestamp(i + 1, 50, 50, 52, 30, 30, 400, 150, 3500, 1800);
         }
         assert_eq!(history.len(), 3600);
         let (s1, s2) = history.as_slices();
         assert_eq!(s1.len() + s2.len(), 3600);
 
         // 3. Vượt quá 1 mẫu (head = 1)
-        history.push_with_timestamp(3601, 70, 70, 60, 60, 550, 250, 4200, 2200);
+        history.push_with_timestamp(3601, 70, 70, 65, 60, 60, 550, 250, 4200, 2200);
         assert_eq!(history.len(), 3600);
         let (s1, s2) = history.as_slices();
         assert_eq!(s1.len(), 3599);
@@ -576,8 +640,8 @@ mod tests {
     #[test]
     fn test_clear_buffer() {
         let mut history = TelemetryHistory::new();
-        history.push_with_timestamp(1, 50, 50, 30, 30, 400, 150, 3500, 1800);
-        history.push_with_timestamp(2, 60, 60, 40, 40, 500, 200, 4000, 2000);
+        history.push_with_timestamp(1, 50, 50, 52, 30, 30, 400, 150, 3500, 1800);
+        history.push_with_timestamp(2, 60, 60, 58, 40, 40, 500, 200, 4000, 2000);
         assert_eq!(history.len(), 2);
 
         history.clear();

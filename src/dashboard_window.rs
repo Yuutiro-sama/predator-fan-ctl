@@ -48,6 +48,9 @@ pub const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF((r as u32) | ((g as u32) << 8) | ((b as u32) << 16))
 }
 
+/// Màu Tím Neon Win32 COLORREF BGR: RGB(188, 140, 255) -> 0x00FF8CBC
+pub const COLOR_SYS_TEMP: COLORREF = rgb(188, 140, 255);
+
 /// Chế độ hiển thị Giao diện (Theme)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppTheme {
@@ -156,6 +159,7 @@ pub struct DashboardSnapshot {
     pub gpu_power_dw: u16,
     pub cpu_mhz: u16,
     pub gpu_mhz: u16,
+    pub system_temp: u32,
     pub active_profile: FanProfile,
     pub governor_enabled: bool,
     pub governor_target_temp: u32,
@@ -176,6 +180,7 @@ impl Default for DashboardSnapshot {
             gpu_power_dw: 0,
             cpu_mhz: 0,
             gpu_mhz: 0,
+            system_temp: 0,
             active_profile: FanProfile::ActiveCurve,
             governor_enabled: true,
             governor_target_temp: 80,
@@ -191,6 +196,7 @@ impl DashboardSnapshot {
         let (cpu_power_dw, gpu_power_dw, cpu_mhz, gpu_mhz) = state.get_metrics();
         let (governor_enabled, governor_target_temp, governor_epp) = state.get_governor_info();
         let active_profile = state.get_profile();
+        let system_temp = state.system_temp.load(Ordering::Relaxed);
 
         Self {
             cpu_temp,
@@ -203,6 +209,7 @@ impl DashboardSnapshot {
             gpu_power_dw,
             cpu_mhz,
             gpu_mhz,
+            system_temp,
             active_profile,
             governor_enabled,
             governor_target_temp,
@@ -245,6 +252,7 @@ pub fn find_button_at(buttons: &[TactileButton], pt: POINT) -> Option<ButtonId> 
 pub struct DashboardLayout {
     pub card_cpu_rect: RECT,
     pub card_gpu_rect: RECT,
+    pub strip_system_rect: RECT,
     pub epp_panel_rect: RECT,
     pub buttons: Vec<TactileButton>,
 }
@@ -259,7 +267,7 @@ pub fn compute_dashboard_layout(
     pressed: Option<ButtonId>,
 ) -> DashboardLayout {
     let w = width.max(480);
-    let h = height.max(400);
+    let h = height.max(440);
 
     let get_state = |id: ButtonId| -> ButtonState {
         if pressed == Some(id) {
@@ -282,20 +290,31 @@ pub fn compute_dashboard_layout(
     // Phân bổ chiều dọc linh hoạt (Proportional Vertical Flex Layout - Không để lại khoảng trống đen)
     let content_top = 48;
     let content_bottom = h - 16;
-    let available_content = (content_bottom - content_top).max(330);
+    let available_content = (content_bottom - content_top).max(370);
 
     let prof_h = ((available_content * 9) / 100).clamp(38, 44);
     let epp_h = prof_h;
     let tool_row_h = prof_h;
+    let strip_h = 34; // Chiều cao thanh SYSTEM / MAINBOARD Telemetry Strip
 
-    let base_gap = ((available_content * 32) / 1000).clamp(10, 24);
+    let base_gap = ((available_content * 28) / 1000).clamp(10, 20);
     let tool_gap = (base_gap * 3 / 4).max(8);
 
-    let total_fixed_lower = prof_h + epp_h + (tool_row_h * 2) + (base_gap * 3) + tool_gap;
+    let total_fixed_lower = strip_h + prof_h + epp_h + (tool_row_h * 2) + (base_gap * 4) + tool_gap;
     let card_h = (available_content - total_fixed_lower).max(140);
     let card_bottom = content_top + card_h;
 
-    let prof_y_top = card_bottom + base_gap;
+    // Dải SYSTEM / MAINBOARD Telemetry Strip nằm giữa 2 card và hàng profile buttons
+    let strip_y_top = card_bottom + base_gap;
+    let strip_y_bottom = strip_y_top + strip_h;
+    let strip_system_rect = RECT {
+        left: 16,
+        top: strip_y_top,
+        right: w - 16,
+        bottom: strip_y_bottom,
+    };
+
+    let prof_y_top = strip_y_bottom + base_gap;
     let prof_y_bottom = prof_y_top + prof_h;
 
     let epp_y_top = prof_y_bottom + base_gap;
@@ -483,6 +502,7 @@ pub fn compute_dashboard_layout(
     DashboardLayout {
         card_cpu_rect,
         card_gpu_rect,
+        strip_system_rect,
         epp_panel_rect,
         buttons,
     }
@@ -554,11 +574,11 @@ fn run_dashboard_window(
 
         let _ = RegisterClassW(&wnd_class);
 
-        // Kích thước chuẩn cơ sở: 600 x 500 px, nhân theo tỉ lệ DPI thực tế
+        // Kích thước chuẩn cơ sở: 600 x 548 px, nhân theo tỉ lệ DPI thực tế (tăng 48px cho Telemetry Strip)
         let sys_dpi = GetDpiForSystem();
         let dpi = if sys_dpi == 0 { 96 } else { sys_dpi as i32 };
         let width = MulDiv(600, dpi, 96);
-        let height = MulDiv(500, dpi, 96);
+        let height = MulDiv(548, dpi, 96);
         let screen_w = GetSystemMetrics(SM_CXSCREEN);
         let screen_h = GetSystemMetrics(SM_CYSCREEN);
         let pos_x = (screen_w - width) / 2;
@@ -822,6 +842,149 @@ unsafe fn draw_telemetry_card(
         palette.text_sec,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
     );
+}
+
+/// Vẽ dải thông số nhiệt độ Mainboard / System (System Telemetry Strip - Lựa chọn B nâng cấp)
+unsafe fn draw_system_telemetry_strip(
+    hdc: HDC,
+    strip_rect: RECT,
+    system_temp: u32,
+    palette: &ThemePalette,
+    font_label: HFONT,
+    font_temp: HFONT,
+) {
+    // 1. Khung nền glassmorphic bo góc 10px đồng bộ, viền mảnh palette.border
+    let strip_pen = CreatePen(PS_SOLID, 1, palette.border);
+    let strip_brush = CreateSolidBrush(palette.card);
+    let old_pen = SelectObject(hdc, strip_pen);
+    let old_brush = SelectObject(hdc, strip_brush);
+
+    let _ = RoundRect(
+        hdc,
+        strip_rect.left,
+        strip_rect.top,
+        strip_rect.right,
+        strip_rect.bottom,
+        10,
+        10,
+    );
+
+    let _ = SelectObject(hdc, old_brush);
+    let _ = SelectObject(hdc, old_pen);
+    let _ = DeleteObject(strip_brush);
+    let _ = DeleteObject(strip_pen);
+
+    let strip_h = strip_rect.bottom - strip_rect.top;
+    let cy = strip_rect.top + strip_h / 2;
+
+    // 2. Bên trái: Icon / biểu tượng bo tròn nhỏ + Nhãn "MAINBOARD / SYSTEM"
+    let dot_radius = 4;
+    let dot_cx = strip_rect.left + 16;
+    let dot_color = if system_temp > 0 {
+        COLOR_SYS_TEMP
+    } else {
+        palette.border
+    };
+    let dot_brush = CreateSolidBrush(dot_color);
+    let dot_pen = CreatePen(PS_SOLID, 1, dot_color);
+    let old_pen = SelectObject(hdc, dot_pen);
+    let old_brush = SelectObject(hdc, dot_brush);
+
+    let _ = Ellipse(
+        hdc,
+        dot_cx - dot_radius,
+        cy - dot_radius,
+        dot_cx + dot_radius + 1,
+        cy + dot_radius + 1,
+    );
+
+    let _ = SelectObject(hdc, old_brush);
+    let _ = SelectObject(hdc, old_pen);
+    let _ = DeleteObject(dot_brush);
+    let _ = DeleteObject(dot_pen);
+
+    // Nhãn "MAINBOARD / SYSTEM" (màu text mờ palette.text_sec)
+    let label_rect = RECT {
+        left: dot_cx + dot_radius + 10,
+        top: strip_rect.top,
+        right: strip_rect.left + 240,
+        bottom: strip_rect.bottom,
+    };
+    let _ = SelectObject(hdc, font_label);
+    draw_text_clipped(
+        hdc,
+        label_rect,
+        "MAINBOARD / SYSTEM",
+        palette.text_sec,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+    );
+
+    // 3. Bên phải: Chữ số nhiệt độ (Tím Neon #BC8CFF) + Mini Level Bar (30°C - 100°C)
+    let (temp_str, temp_color) = if system_temp > 0 {
+        (format!("{}°C", system_temp), COLOR_SYS_TEMP)
+    } else {
+        ("-- °C".to_string(), rgb(128, 138, 150)) // Xám mờ khi 0
+    };
+
+    let _ = SelectObject(hdc, font_temp);
+    let wide_temp: Vec<u16> = temp_str.encode_utf16().collect();
+    let mut size_temp = windows::Win32::Foundation::SIZE::default();
+    let _ = GetTextExtentPoint32W(hdc, &wide_temp, &mut size_temp);
+
+    let temp_right = strip_rect.right - 16;
+    let temp_left = temp_right - size_temp.cx;
+    let temp_rect = RECT {
+        left: temp_left,
+        top: strip_rect.top,
+        right: temp_right,
+        bottom: strip_rect.bottom,
+    };
+    draw_text_clipped(
+        hdc,
+        temp_rect,
+        &temp_str,
+        temp_color,
+        DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+    );
+
+    // Mini level bar: nằm bên trái temp_rect
+    // Chiều rộng bar: 70px, chiều cao: 6px
+    let bar_w = 70;
+    let bar_h = 6;
+    let bar_right = temp_left - 12;
+    let bar_left = bar_right - bar_w;
+    let bar_top = cy - (bar_h / 2);
+    let bar_bottom = bar_top + bar_h;
+
+    let bar_track_rect = RECT {
+        left: bar_left,
+        top: bar_top,
+        right: bar_right,
+        bottom: bar_bottom,
+    };
+
+    // Nền thanh bar (palette.bar_bg)
+    let track_brush = CreateSolidBrush(palette.bar_bg);
+    FillRect(hdc, &bar_track_rect, track_brush);
+    let _ = DeleteObject(track_brush);
+
+    // Tiến trình nhiệt độ (30°C ..= 100°C)
+    if system_temp >= 30 {
+        let clamped = system_temp.clamp(30, 100);
+        let ratio = (clamped - 30) as f32 / 70.0;
+        let fill_w = ((bar_w as f32) * ratio).round() as i32;
+        if fill_w > 0 {
+            let fill_rect = RECT {
+                left: bar_left,
+                top: bar_top,
+                right: (bar_left + fill_w).min(bar_right),
+                bottom: bar_bottom,
+            };
+            let fill_brush = CreateSolidBrush(COLOR_SYS_TEMP);
+            FillRect(hdc, &fill_rect, fill_brush);
+            let _ = DeleteObject(fill_brush);
+        }
+    }
 }
 
 /// Vẽ cụm công tắc gạt xúc giác (Modern Tactile Pill Toggle Switch)
@@ -1149,6 +1312,16 @@ unsafe fn paint_dashboard(
         font_card_header,
         font_temp,
         font_sub_metric,
+    );
+
+    // 3b. Khối hiển thị SYSTEM / MAINBOARD TELEMETRY STRIP (Lựa chọn B nâng cấp)
+    draw_system_telemetry_strip(
+        hdc,
+        layout.strip_system_rect,
+        snapshot.system_temp,
+        &palette,
+        font_card_header,
+        font_btn_bold,
     );
 
     // 4. Panel Khóa nhiệt độ CPU (Smooth EPP) từ Layout động
@@ -1564,6 +1737,7 @@ mod tests {
             gpu_power_dw: 185,
             cpu_mhz: 3800,
             gpu_mhz: 2200,
+            system_temp: 54,
             active_profile: FanProfile::Turbo,
             governor_enabled: true,
             governor_target_temp: 80,
@@ -1735,6 +1909,7 @@ mod tests {
             gpu_power_dw: 200,
             cpu_mhz: 4000,
             gpu_mhz: 2300,
+            system_temp: 54,
             active_profile: FanProfile::ActiveCurve,
             governor_enabled: true,
             governor_target_temp: 85,
@@ -1742,8 +1917,8 @@ mod tests {
             reload_flash_ticks: 0,
         };
 
-        // Kiểm tra 4 kích thước: nhỏ nhất (480x420), cũ (540x450), chuẩn mới (600x500), và mở rộng lớn (1000x800)
-        let sizes = [(480, 420), (540, 450), (600, 500), (1000, 800)];
+        // Kiểm tra 4 kích thước: nhỏ nhất (480x440), cũ (540x480), chuẩn mới (600x548), và mở rộng lớn (1000x800)
+        let sizes = [(480, 440), (540, 480), (600, 548), (1000, 800)];
 
         for &(w, h) in &sizes {
             let layout = compute_dashboard_layout(
@@ -1768,13 +1943,20 @@ mod tests {
             assert!(layout.card_cpu_rect.left >= 16);
             assert!(layout.card_gpu_rect.right <= w - 16);
 
-            // 2. Kiểm tra EPP Panel
+            // 2. Kiểm tra System Telemetry Strip nằm giữa 2 card và Profiles Buttons
+            assert!(layout.strip_system_rect.left >= 16);
+            assert!(layout.strip_system_rect.right <= w - 16);
+            assert!(layout.strip_system_rect.top >= layout.card_cpu_rect.bottom);
+            let prof_btn = layout.buttons.iter().find(|b| b.id == ButtonId::ProfileCurve).unwrap();
+            assert!(layout.strip_system_rect.bottom <= prof_btn.rect.top);
+
+            // 3. Kiểm tra EPP Panel
             assert!(layout.epp_panel_rect.left >= 16);
             assert!(layout.epp_panel_rect.right <= w - 16);
-            assert!(layout.epp_panel_rect.top >= layout.card_cpu_rect.bottom);
+            assert!(layout.epp_panel_rect.top >= prof_btn.rect.bottom);
             assert!(layout.epp_panel_rect.bottom <= h);
 
-            // 3. Kiểm tra số lượng và tính hợp lệ của tất cả các nút
+            // 4. Kiểm tra số lượng và tính hợp lệ của tất cả các nút
             assert_eq!(layout.buttons.len(), 9);
             for btn in &layout.buttons {
                 assert!(btn.rect.left < btn.rect.right, "Nút {:?} có width <= 0", btn.id);
@@ -1783,7 +1965,7 @@ mod tests {
                 assert!(btn.rect.top >= 0 && btn.rect.bottom <= h, "Nút {:?} vượt biên dọc", btn.id);
             }
 
-            // 4. Kiểm tra Flex Layout: hàng nút cuối (ExitApp) chạm đúng đáy h - 16, không có khoảng trống đen hổng
+            // 5. Kiểm tra Flex Layout: hàng nút cuối (ExitApp) chạm đúng đáy h - 16, không có khoảng trống đen hổng
             let exit_btn = layout.buttons.iter().find(|b| b.id == ButtonId::ExitApp).unwrap();
             assert_eq!(exit_btn.rect.bottom, h - 16, "Hàng nút đáy phải chạm đúng h - 16");
         }
@@ -1812,7 +1994,7 @@ mod tests {
                 class_name,
                 w!("Test Dashboard"),
                 WS_OVERLAPPEDWINDOW,
-                100, 100, 600, 500,
+                100, 100, 600, 548,
                 HWND::default(),
                 HMENU::default(),
                 hinstance,

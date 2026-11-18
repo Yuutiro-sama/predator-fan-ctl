@@ -7,7 +7,7 @@
 //!    nạp động driver thông dụng (`inpoutx64.dll` hoặc `WinRing0x64.dll`). Độ trễ < 1ms.
 
 use windows::core::{BSTR, PCSTR, PCWSTR, VARIANT};
-use windows::Win32::Foundation::{FreeLibrary, HMODULE};
+use windows::Win32::Foundation::{FreeLibrary, BOOL, HANDLE, HMODULE};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoSetProxyBlanket, CLSCTX_INPROC_SERVER,
     COINIT_MULTITHREADED, EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL,
@@ -15,6 +15,35 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Wmi::*;
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn WaitNamedPipeW(lpNamedPipeName: *const u16, nTimeOut: u32) -> BOOL;
+    fn CreateFileW(
+        lpFileName: *const u16,
+        dwDesiredAccess: u32,
+        dwShareMode: u32,
+        lpSecurityAttributes: *const std::ffi::c_void,
+        dwCreationDisposition: u32,
+        dwFlagsAndAttributes: u32,
+        hTemplateFile: HANDLE,
+    ) -> HANDLE;
+    fn ReadFile(
+        hFile: HANDLE,
+        lpBuffer: *mut std::ffi::c_void,
+        nNumberOfBytesToRead: u32,
+        lpNumberOfBytesRead: *mut u32,
+        lpOverlapped: *mut std::ffi::c_void,
+    ) -> BOOL;
+    fn WriteFile(
+        hFile: HANDLE,
+        lpBuffer: *const std::ffi::c_void,
+        nNumberOfBytesToWrite: u32,
+        lpNumberOfBytesWritten: *mut u32,
+        lpOverlapped: *mut std::ffi::c_void,
+    ) -> BOOL;
+    fn CloseHandle(hObject: HANDLE) -> BOOL;
+}
 
 /// Trait chuẩn cho các backend điều khiển quạt phần cứng.
 pub trait FanController: Send {
@@ -32,6 +61,11 @@ pub trait FanController: Send {
 
     /// Đọc tốc độ vòng quay quạt (RPM) trực tiếp từ cảm biến phần cứng (CPU RPM, GPU RPM).
     fn read_fan_rpms(&mut self) -> Option<(u32, u32)> {
+        None
+    }
+
+    /// Đọc nhiệt độ bo mạch / hệ thống (°C) nếu backend hoặc OEM hardware service hỗ trợ.
+    fn read_system_temp(&mut self) -> Option<u32> {
         None
     }
 
@@ -76,6 +110,12 @@ pub const ACER_FAN_BEHAVIOR_CUSTOM_LEGACY: u64 = 0xC30009; // CPU (Bit 0) + GPU 
 pub const ACER_FAN_BEHAVIOR_AUTO_LEGACY: u64 = 0x410009;
 pub const ACER_FAN_BEHAVIOR_TURBO_LEGACY: u64 = 0x820009;
 
+/// Mã lệnh WMI / OEM đo nhiệt độ bo mạch / hệ thống
+pub const CMD_SYS_TEMP: u32 = 0x0301;
+
+/// Đường dẫn Named Pipe phục vụ đo đạc phần cứng của Acer PredatorSense Service
+pub const PIPE_HARDWARE_SERVICE: &str = "\\\\.\\pipe\\systemmonitoring_hardware_service_\0";
+
 /// Backend điều khiển quạt qua giao diện ACPI-WMI của Acer (`AcerGamingFunction`).
 pub struct AcerWmiBackend {
     services: IWbemServices,
@@ -86,6 +126,8 @@ pub struct AcerWmiBackend {
     fan_sys_info_in_class: Option<IWbemClassObject>,
     get_fan_speed_in_class: Option<IWbemClassObject>,
     gpu_fan_index: Option<u8>,
+    pipe_fail_count: u32,
+    pipe_cooldown_until: Option<std::time::Instant>,
 }
 
 unsafe impl Send for AcerWmiBackend {}
@@ -238,6 +280,8 @@ impl AcerWmiBackend {
                 fan_sys_info_in_class,
                 get_fan_speed_in_class,
                 gpu_fan_index: None,
+                pipe_fail_count: 0,
+                pipe_cooldown_until: None,
             };
 
             // Khởi động probe cảm biến quạt một lần duy nhất
@@ -426,6 +470,131 @@ impl AcerWmiBackend {
             (cpu_rpm, gpu_rpm)
         }
     }
+
+    /// Ghi nhận 1 lần thất bại của Named Pipe và kích hoạt Circuit Breaker nếu vượt ngưỡng 3 lần liên tiếp
+    fn record_pipe_failure(&mut self) {
+        self.pipe_fail_count = self.pipe_fail_count.saturating_add(1);
+        if self.pipe_fail_count >= 3 && self.pipe_cooldown_until.is_none() {
+            self.pipe_cooldown_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+            append_debug_log("[PIPE CIRCUIT BREAKER] Named pipe failed 3 consecutive times. Cooldown 30s activated.");
+        }
+    }
+
+    /// Đọc nhiệt độ qua Named Pipe `\\.\pipe\systemmonitoring_hardware_service_`
+    /// Cơ chế non-blocking: Timeout 50ms và Circuit Breaker cooldown 30s
+    pub fn read_system_temp_pipe(&mut self) -> Option<u32> {
+        let now = std::time::Instant::now();
+        if let Some(cooldown) = self.pipe_cooldown_until {
+            if now < cooldown {
+                return None;
+            }
+            // Cooldown đã hết, mở lại trạng thái thử nghiệm
+            self.pipe_cooldown_until = None;
+            self.pipe_fail_count = 0;
+        }
+
+        let wide_name: Vec<u16> = PIPE_HARDWARE_SERVICE.encode_utf16().collect();
+        unsafe {
+            // Kiểm tra sự tồn tại và khả năng đáp ứng của pipe với timeout tối đa 50ms
+            if WaitNamedPipeW(wide_name.as_ptr(), 50).0 == 0 {
+                self.record_pipe_failure();
+                return None;
+            }
+
+            let handle = CreateFileW(
+                wide_name.as_ptr(),
+                0x80000000 | 0x40000000, // GENERIC_READ | GENERIC_WRITE
+                0,
+                std::ptr::null(),
+                3, // OPEN_EXISTING
+                0,
+                HANDLE(std::ptr::null_mut()),
+            );
+
+            if handle.is_invalid() || handle.0.is_null() {
+                self.record_pipe_failure();
+                return None;
+            }
+
+            // Gói tin nhị phân chuẩn 11 bytes:
+            // cmd_id = 7 (u16), num_args = 1 (u8), arg_len = 4 (u32), subcmd = 0x0301 (u32)
+            let mut req = [0u8; 11];
+            req[0..2].copy_from_slice(&7u16.to_le_bytes());
+            req[2] = 1u8;
+            req[3..7].copy_from_slice(&4u32.to_le_bytes());
+            req[7..11].copy_from_slice(&CMD_SYS_TEMP.to_le_bytes());
+
+            let mut written = 0u32;
+            let write_ok = WriteFile(
+                handle,
+                req.as_ptr() as *const std::ffi::c_void,
+                req.len() as u32,
+                &mut written,
+                std::ptr::null_mut(),
+            );
+
+            if write_ok.0 == 0 || written != 11 {
+                let _ = CloseHandle(handle);
+                self.record_pipe_failure();
+                return None;
+            }
+
+            let mut resp = [0u8; 64];
+            let mut read_bytes = 0u32;
+            let read_ok = ReadFile(
+                handle,
+                resp.as_mut_ptr() as *mut std::ffi::c_void,
+                resp.len() as u32,
+                &mut read_bytes,
+                std::ptr::null_mut(),
+            );
+            let _ = CloseHandle(handle);
+
+            if read_ok.0 == 0 || read_bytes < 7 {
+                self.record_pipe_failure();
+                return None;
+            }
+
+            // Byte 6 chứa giá trị nhiệt độ Celsius
+            let temp = resp[6] as u32;
+            if (15..=115).contains(&temp) {
+                self.pipe_fail_count = 0;
+                self.pipe_cooldown_until = None;
+                Some(temp)
+            } else {
+                self.record_pipe_failure();
+                None
+            }
+        }
+    }
+
+    /// Đọc nhiệt độ Mainboard/System (°C):
+    /// - Primary: WMI GetGamingSysInfo(0x0301)
+    /// - Fallback: Named Pipe `\\.\pipe\systemmonitoring_hardware_service_`
+    /// - Lọc dải nhiệt độ hợp lệ: 15..=115
+    pub fn read_system_temp(&mut self) -> Option<u32> {
+        // 1. Ưu tiên WMI GetGamingSysInfo(0x0301)
+        unsafe {
+            if let Some(val) = self.call_wmi_getter_u32_to_u64("GetGamingSysInfo", self.fan_sys_info_in_class.as_ref(), CMD_SYS_TEMP) {
+                let b0 = (val & 0xFF) as u32;
+                let b1 = ((val >> 8) & 0xFF) as u32;
+                let candidate = if (15..=115).contains(&b0) {
+                    Some(b0)
+                } else if (15..=115).contains(&b1) {
+                    Some(b1)
+                } else {
+                    None
+                };
+
+                if let Some(t) = candidate {
+                    return Some(t);
+                }
+            }
+        }
+
+        // 2. Fallback sang Named Pipe với Circuit Breaker & Timeout 50ms
+        self.read_system_temp_pipe()
+    }
 }
 
 impl FanController for AcerWmiBackend {
@@ -584,6 +753,10 @@ impl FanController for AcerWmiBackend {
         } else {
             None
         }
+    }
+
+    fn read_system_temp(&mut self) -> Option<u32> {
+        self.read_system_temp()
     }
 
     fn read_temps(&mut self) -> Option<(u32, u32)> {
@@ -860,5 +1033,44 @@ mod tests {
         // Khi không có driver inpoutx64 / WinRing0, backend trả về None an toàn tuyệt đối
         let regs = EcRegisterMap::default();
         let _ec = DirectEcBackend::new(regs);
+    }
+
+    #[test]
+    fn test_named_pipe_request_packet_format() {
+        let mut req = [0u8; 11];
+        req[0..2].copy_from_slice(&7u16.to_le_bytes());
+        req[2] = 1u8;
+        req[3..7].copy_from_slice(&4u32.to_le_bytes());
+        req[7..11].copy_from_slice(&CMD_SYS_TEMP.to_le_bytes());
+
+        assert_eq!(req.len(), 11);
+        // cmd_id = 7 (u16 little-endian: 0x07, 0x00)
+        assert_eq!(&req[0..2], &[0x07, 0x00]);
+        // num_args = 1
+        assert_eq!(req[2], 0x01);
+        // arg_len = 4 (u32 little-endian: 0x04, 0x00, 0x00, 0x00)
+        assert_eq!(&req[3..7], &[0x04, 0x00, 0x00, 0x00]);
+        // subcmd = 0x0301 (u32 little-endian: 0x01, 0x03, 0x00, 0x00)
+        assert_eq!(&req[7..11], &[0x01, 0x03, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn test_named_pipe_response_temperature_parsing() {
+        // Mô phỏng payload trả về thực tế từ Acer Service: 13 bytes
+        let mut resp = [0u8; 13];
+        resp[0] = 0x01;
+        resp[1] = 0x08;
+        resp[6] = 58; // 58°C
+
+        let temp = resp[6] as u32;
+        assert!((15..=115).contains(&temp));
+        assert_eq!(temp, 58);
+
+        // Kiểm tra lọc giá trị bất thường / rác firmware EC (0°C, 255°C, 120°C)
+        assert!(!(15..=115).contains(&0u32));
+        assert!(!(15..=115).contains(&255u32));
+        assert!(!(15..=115).contains(&120u32));
+        assert!((15..=115).contains(&15u32));
+        assert!((15..=115).contains(&115u32));
     }
 }

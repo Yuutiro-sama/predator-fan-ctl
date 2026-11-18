@@ -15,6 +15,7 @@ use serde::Deserialize;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{FreeLibrary, HMODULE};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use crate::fan_backend::FanController;
 
 // ============================================================================
 // 1. GPU SENSOR (Dynamic FFI NVML)
@@ -768,6 +769,7 @@ pub struct SystemTelemetryReader {
     cpu_power: Option<CpuPowerSensor>,
     last_cpu_temp: u32,
     last_gpu_temp: u32,
+    last_system_temp: Option<(u32, std::time::Instant)>,
     last_cpu_power_dw: u16,
     last_gpu_power_dw: u16,
     last_cpu_mhz: u16,
@@ -792,6 +794,7 @@ impl SystemTelemetryReader {
             cpu_power,
             last_cpu_temp: 45,
             last_gpu_temp: 40,
+            last_system_temp: None,
             last_cpu_power_dw: 0,
             last_gpu_power_dw: 0,
             last_cpu_mhz: 2500,
@@ -799,13 +802,13 @@ impl SystemTelemetryReader {
         };
 
         // Đọc mồi lần đầu
-        let _ = reader.poll();
+        let _ = reader.poll(None);
         reader
     }
 
     /// Đọc đồng thời toàn bộ thông số:
-    /// `(cpu_temp: u32, gpu_temp: u32, cpu_power_dw: u16, gpu_power_dw: u16, cpu_mhz: u16, gpu_mhz: u16)`
-    pub fn poll(&mut self) -> (u32, u32, u16, u16, u16, u16) {
+    /// `(cpu_temp: u32, gpu_temp: u32, system_temp: u32, cpu_power_dw: u16, gpu_power_dw: u16, cpu_mhz: u16, gpu_mhz: u16)`
+    pub fn poll(&mut self, mut backend: Option<&mut dyn FanController>) -> (u32, u32, u32, u16, u16, u16, u16) {
         if let Some(t) = self.cpu_temp.read_temp() {
             self.last_cpu_temp = t;
         }
@@ -825,14 +828,44 @@ impl SystemTelemetryReader {
             self.last_cpu_power_dw = pwr.sample_deciwatts();
         }
 
+        // Đọc nhiệt độ bo mạch / hệ thống qua backend với bộ lọc TTL 5 giây
+        let mut current_sys_temp = 0u32;
+        if let Some(ref mut b) = backend {
+            if let Some(t) = b.read_system_temp() {
+                self.last_system_temp = Some((t, std::time::Instant::now()));
+                current_sys_temp = t;
+            }
+        }
+
+        if current_sys_temp == 0 {
+            if let Some((old_t, recorded_at)) = self.last_system_temp {
+                if recorded_at.elapsed() <= std::time::Duration::from_secs(5) {
+                    current_sys_temp = old_t;
+                } else {
+                    self.last_system_temp = None;
+                }
+            }
+        }
+
         (
             self.last_cpu_temp,
             self.last_gpu_temp,
+            current_sys_temp,
             self.last_cpu_power_dw,
             self.last_gpu_power_dw,
             self.last_cpu_mhz,
             self.last_gpu_mhz,
         )
+    }
+
+    #[inline]
+    pub fn last_system_temp(&self) -> u32 {
+        if let Some((t, recorded_at)) = self.last_system_temp {
+            if recorded_at.elapsed() <= std::time::Duration::from_secs(5) {
+                return t;
+            }
+        }
+        0
     }
 
     #[inline]
@@ -973,20 +1006,58 @@ mod tests {
         }
     }
 
+    struct MockFanController {
+        system_temp: Option<u32>,
+    }
+
+    impl FanController for MockFanController {
+        fn set_manual_mode(&mut self) -> bool { true }
+        fn set_auto_mode(&mut self) -> bool { true }
+        fn set_speeds(&mut self, _cpu_pct: u8, _gpu_pct: u8) -> bool { true }
+        fn read_temps(&mut self) -> Option<(u32, u32)> { None }
+        fn read_system_temp(&mut self) -> Option<u32> { self.system_temp }
+        fn name(&self) -> &'static str { "Mock Fan Controller" }
+    }
+
     #[test]
     fn test_system_telemetry_reader() {
         let mut reader = SystemTelemetryReader::new();
-        let (cpu_t, gpu_t, cpu_p, gpu_p, cpu_clk, gpu_clk) = reader.poll();
+        let (cpu_t, gpu_t, sys_t, cpu_p, gpu_p, cpu_clk, gpu_clk) = reader.poll(None);
         println!(
-            "SystemTelemetry: CPU: {}°C, {:.1}W, {}MHz | GPU: {}°C, {:.1}W, {}MHz",
+            "SystemTelemetry: CPU: {}°C, {:.1}W, {}MHz | GPU: {}°C, {:.1}W, {}MHz | Sys: {}°C",
             cpu_t,
             cpu_p as f32 / 10.0,
             cpu_clk,
             gpu_t,
             gpu_p as f32 / 10.0,
-            gpu_clk
+            gpu_clk,
+            sys_t
         );
         assert!(cpu_t >= 20 && cpu_t <= 115);
         assert!(cpu_clk > 400);
+        assert_eq!(sys_t, 0); // Khi không có backend thì system_temp trả về 0
+    }
+
+    #[test]
+    fn test_system_telemetry_reader_system_temp_ttl() {
+        let mut reader = SystemTelemetryReader::new();
+        let mut mock = MockFanController { system_temp: Some(58) };
+
+        // 1. Đọc có giá trị từ backend -> trả về 58
+        let (_, _, sys_t, _, _, _, _) = reader.poll(Some(&mut mock));
+        assert_eq!(sys_t, 58);
+        assert_eq!(reader.last_system_temp(), 58);
+
+        // 2. Lần sau backend trả về None nhưng chưa quá 5 giây -> giữ nguyên 58 (chống nhiễu)
+        mock.system_temp = None;
+        let (_, _, sys_t_cached, _, _, _, _) = reader.poll(Some(&mut mock));
+        assert_eq!(sys_t_cached, 58);
+        assert_eq!(reader.last_system_temp(), 58);
+
+        // 3. Giả lập mẫu cũ quá hạn 5 giây (ghi đè thời điểm ghi nhận lùi về 6 giây trước)
+        reader.last_system_temp = Some((58, std::time::Instant::now() - std::time::Duration::from_secs(6)));
+        let (_, _, sys_t_expired, _, _, _, _) = reader.poll(Some(&mut mock));
+        assert_eq!(sys_t_expired, 0);
+        assert_eq!(reader.last_system_temp(), 0);
     }
 }

@@ -321,12 +321,14 @@ fn main() {
         println!("[CONTROLLER] Active Backend: {}", backend.name());
         backend.set_manual_mode();
 
-        // Khởi tạo Trình đọc telemetry toàn diện (NVML FFI cho GPU, ACPI cho CPU Temp, PowrProf cho CPU Clock, PDH cho CPU Power)
+        // Khởi tạo Trình đọc telemetry toàn diện (NVML FFI cho GPU, ACPI cho CPU Temp, PowrProf cho CPU Clock, PDH cho CPU Power, WMI/Pipe cho Sys Temp)
         let mut telemetry_reader = SystemTelemetryReader::new();
-        let (init_cpu_t, init_gpu_t, init_cpu_power, init_gpu_power, init_cpu_mhz, init_gpu_mhz) = telemetry_reader.poll();
-        println!("[SENSOR] Initial telemetry - CPU: {}°C ({:.1}W, {}MHz), GPU: {}°C ({:.1}W, {}MHz) (NVML GPU sensor active: {})",
+        let (init_cpu_t, init_gpu_t, init_sys_t, init_cpu_power, init_gpu_power, init_cpu_mhz, init_gpu_mhz) =
+            telemetry_reader.poll(Some(&mut *backend));
+        println!("[SENSOR] Initial telemetry - CPU: {}°C ({:.1}W, {}MHz), GPU: {}°C ({:.1}W, {}MHz), Sys: {}°C (NVML GPU sensor active: {})",
             init_cpu_t, init_cpu_power as f32 / 10.0, init_cpu_mhz,
             init_gpu_t, init_gpu_power as f32 / 10.0, init_gpu_mhz,
+            init_sys_t,
             telemetry_reader.has_gpu_sensor());
 
         let mut last_cpu_speed = evaluate_curve(&worker_config.cpu_curve, init_cpu_t);
@@ -337,19 +339,34 @@ fn main() {
             init_cpu_t, last_cpu_speed, init_gpu_t, last_gpu_speed, init_cpu_rpm, init_gpu_rpm,
             init_cpu_power, init_gpu_power, init_cpu_mhz, init_gpu_mhz,
         );
-        let init_tip = format!(
-            "CPU: {}°C {:.1}W {:.2}GHz | GPU: {}°C {:.1}W {:.2}GHz",
-            init_cpu_t,
-            init_cpu_power as f32 / 10.0,
-            init_cpu_mhz as f32 / 1000.0,
-            init_gpu_t,
-            init_gpu_power as f32 / 10.0,
-            init_gpu_mhz as f32 / 1000.0,
-        );
+        worker_tray_handle.update_system_temp(init_sys_t);
+
+        let init_tip = if init_sys_t > 0 {
+            format!(
+                "CPU: {}°C {:.1}W {:.2}GHz | GPU: {}°C {:.1}W {:.2}GHz | Sys: {}°C",
+                init_cpu_t,
+                init_cpu_power as f32 / 10.0,
+                init_cpu_mhz as f32 / 1000.0,
+                init_gpu_t,
+                init_gpu_power as f32 / 10.0,
+                init_gpu_mhz as f32 / 1000.0,
+                init_sys_t,
+            )
+        } else {
+            format!(
+                "CPU: {}°C {:.1}W {:.2}GHz | GPU: {}°C {:.1}W {:.2}GHz",
+                init_cpu_t,
+                init_cpu_power as f32 / 10.0,
+                init_cpu_mhz as f32 / 1000.0,
+                init_gpu_t,
+                init_gpu_power as f32 / 10.0,
+                init_gpu_mhz as f32 / 1000.0,
+            )
+        };
         worker_tray_handle.update_tooltip(&init_tip);
         if let Ok(mut hist) = worker_telemetry.try_lock() {
             hist.push(
-                init_cpu_t as u8, init_gpu_t as u8, last_cpu_speed, last_gpu_speed,
+                init_cpu_t as u8, init_gpu_t as u8, init_sys_t as u8, last_cpu_speed, last_gpu_speed,
                 init_cpu_power, init_gpu_power, init_cpu_mhz, init_gpu_mhz,
             );
         }
@@ -447,8 +464,9 @@ fn main() {
                 break;
             }
 
-            // Đọc toàn bộ thông số cảm biến thời gian thực
-            let (cpu_temp, gpu_temp, cpu_power, gpu_power, cpu_mhz, gpu_mhz) = telemetry_reader.poll();
+            // Đọc toàn bộ thông số cảm biến thời gian thực (bao gồm cả system_temp)
+            let (cpu_temp, gpu_temp, system_temp, cpu_power, gpu_power, cpu_mhz, gpu_mhz) =
+                telemetry_reader.poll(Some(&mut *backend));
 
             // Tính toán tốc độ quạt mục tiêu dựa theo Profile
             let active_profile = worker_tray_handle.get_profile();
@@ -486,30 +504,44 @@ fn main() {
             // Đọc RPM thời gian thực từ cảm biến phần cứng
             let (cpu_rpm, gpu_rpm) = backend.read_fan_rpms().unwrap_or((0, 0));
 
-            // Cập nhật trạng thái System Tray (bao gồm cả công suất và xung nhịp)
+            // Cập nhật trạng thái System Tray (bao gồm cả công suất, xung nhịp và nhiệt độ hệ thống)
             worker_tray_handle.update_full_status(
                 cpu_temp, target_cpu_speed, gpu_temp, target_gpu_speed, cpu_rpm, gpu_rpm,
                 cpu_power, gpu_power, cpu_mhz, gpu_mhz,
             );
+            worker_tray_handle.update_system_temp(system_temp);
 
             // Cập nhật bộ đệm lịch sử Telemetry (Zero-Allocation micro-lock)
             if let Ok(mut hist) = worker_telemetry.try_lock() {
                 hist.push(
-                    cpu_temp as u8, gpu_temp as u8, target_cpu_speed, target_gpu_speed,
+                    cpu_temp as u8, gpu_temp as u8, system_temp as u8, target_cpu_speed, target_gpu_speed,
                     cpu_power, gpu_power, cpu_mhz, gpu_mhz,
                 );
             }
 
-            // Cập nhật tooltip khay hệ thống hiển thị: "CPU: XX°C XX.XW X.XXGHz | GPU: XX°C XX.XW X.XXGHz"
-            let tip = format!(
-                "CPU: {}°C {:.1}W {:.2}GHz | GPU: {}°C {:.1}W {:.2}GHz",
-                cpu_temp,
-                cpu_power as f32 / 10.0,
-                cpu_mhz as f32 / 1000.0,
-                gpu_temp,
-                gpu_power as f32 / 10.0,
-                gpu_mhz as f32 / 1000.0,
-            );
+            // Cập nhật tooltip khay hệ thống hiển thị: "CPU: XX°C XX.XW X.XXGHz | GPU: XX°C XX.XW X.XXGHz (| Sys: ZZ°C)"
+            let tip = if system_temp > 0 {
+                format!(
+                    "CPU: {}°C {:.1}W {:.2}GHz | GPU: {}°C {:.1}W {:.2}GHz | Sys: {}°C",
+                    cpu_temp,
+                    cpu_power as f32 / 10.0,
+                    cpu_mhz as f32 / 1000.0,
+                    gpu_temp,
+                    gpu_power as f32 / 10.0,
+                    gpu_mhz as f32 / 1000.0,
+                    system_temp,
+                )
+            } else {
+                format!(
+                    "CPU: {}°C {:.1}W {:.2}GHz | GPU: {}°C {:.1}W {:.2}GHz",
+                    cpu_temp,
+                    cpu_power as f32 / 10.0,
+                    cpu_mhz as f32 / 1000.0,
+                    gpu_temp,
+                    gpu_power as f32 / 10.0,
+                    gpu_mhz as f32 / 1000.0,
+                )
+            };
             worker_tray_handle.update_tooltip(&tip);
 
             // Ngủ theo khoảng thời gian cấu hình (chia nhỏ 50ms để đáp ứng lệnh thoát tức thì)

@@ -1,6 +1,6 @@
 ; installer/predator-fan-ctl.iss
 #define MyAppName "Predator Fan Controller"
-#define MyAppVersion "1.5.1"
+#define MyAppVersion "1.5.2"
 #define MyAppPublisher "Predator Thermal Engineering"
 #define MyAppExeName "predator-fan-ctl.exe"
 

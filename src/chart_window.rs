@@ -80,6 +80,7 @@ const COLOR_GRID: COLORREF = rgb(40, 44, 52);         // #282C34
 const COLOR_WARN_85: COLORREF = rgb(255, 69, 58);     // #FF453A (Đỏ cảnh báo rực rỡ)
 const COLOR_CPU: COLORREF = rgb(0, 229, 255);         // #00E5FF (Cyan sáng rực)
 const COLOR_GPU: COLORREF = rgb(255, 145, 0);         // #FF9100 (Orange sáng rực)
+pub const COLOR_MAINBOARD: COLORREF = rgb(188, 140, 255); // #BC8CFF (Win32 COLORREF BGR: 0x00FF8CBC)
 const COLOR_TEXT_MUTED: COLORREF = rgb(176, 190, 208); // #B0BED0 (Chữ phụ tương phản cao)
 const COLOR_TEXT_LIGHT: COLORREF = rgb(240, 244, 248); // #F0F4F8 (Trắng sáng nét căng)
 const COLOR_CROSSHAIR: COLORREF = rgb(120, 130, 150); // #788296
@@ -515,43 +516,86 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
 
     match samples.last() {
         Some(s) => {
-            let cpu_hud = format!(
-                "CPU: {}°C | {:.1}W | {:.2} GHz",
-                s.cpu_temp,
-                s.cpu_power_w(),
-                s.cpu_ghz()
-            );
-            let gpu_hud = format!(
-                "GPU: {}°C | {:.1}W | {:.2} GHz",
-                s.gpu_temp,
-                s.gpu_power_w(),
-                s.gpu_ghz()
-            );
+            if state.active_mode == ChartMode::TempAndFan {
+                let cpu_hud = format!("CPU: {}°C", s.cpu_temp);
+                let sep = "  |  ";
+                let gpu_hud = format!("GPU: {}°C", s.gpu_temp);
+                let main_hud = if s.system_temp > 0 {
+                    format!("Main: {}°C", s.system_temp)
+                } else {
+                    "Main: --".to_string()
+                };
 
-            let wide_cpu: Vec<u16> = cpu_hud.encode_utf16().collect();
-            let mut size_cpu = windows::Win32::Foundation::SIZE::default();
-            let _ = GetTextExtentPoint32W(hdc, &wide_cpu, &mut size_cpu);
+                let wide_cpu: Vec<u16> = cpu_hud.encode_utf16().collect();
+                let mut size_cpu = windows::Win32::Foundation::SIZE::default();
+                let _ = GetTextExtentPoint32W(hdc, &wide_cpu, &mut size_cpu);
 
-            let bullet = "   •   ";
-            let wide_bullet: Vec<u16> = bullet.encode_utf16().collect();
-            let mut size_bullet = windows::Win32::Foundation::SIZE::default();
-            let _ = GetTextExtentPoint32W(hdc, &wide_bullet, &mut size_bullet);
+                let wide_sep: Vec<u16> = sep.encode_utf16().collect();
+                let mut size_sep = windows::Win32::Foundation::SIZE::default();
+                let _ = GetTextExtentPoint32W(hdc, &wide_sep, &mut size_sep);
 
-            let x_bullet = hud_x + size_cpu.cx;
-            let x_gpu = x_bullet + size_bullet.cx;
+                let wide_gpu: Vec<u16> = gpu_hud.encode_utf16().collect();
+                let mut size_gpu = windows::Win32::Foundation::SIZE::default();
+                let _ = GetTextExtentPoint32W(hdc, &wide_gpu, &mut size_gpu);
 
-            draw_text_line(hdc, hud_x, hud_text_y, &cpu_hud, COLOR_CPU);
-            draw_text_line(hdc, x_bullet, hud_text_y, bullet, COLOR_TEXT_LIGHT);
-            draw_text_line(hdc, x_gpu, hud_text_y, &gpu_hud, COLOR_GPU);
+                let x_cpu = hud_x;
+                let x_sep1 = x_cpu + size_cpu.cx;
+                let x_gpu = x_sep1 + size_sep.cx;
+                let x_sep2 = x_gpu + size_gpu.cx;
+                let x_main = x_sep2 + size_sep.cx;
+
+                draw_text_line(hdc, x_cpu, hud_text_y, &cpu_hud, COLOR_CPU);
+                draw_text_line(hdc, x_sep1, hud_text_y, sep, COLOR_TEXT_MUTED);
+                draw_text_line(hdc, x_gpu, hud_text_y, &gpu_hud, COLOR_GPU);
+                draw_text_line(hdc, x_sep2, hud_text_y, sep, COLOR_TEXT_MUTED);
+                draw_text_line(hdc, x_main, hud_text_y, &main_hud, COLOR_MAINBOARD);
+            } else {
+                let cpu_hud = format!(
+                    "CPU: {:.1}W | {:.2} GHz",
+                    s.cpu_power_w(),
+                    s.cpu_ghz()
+                );
+                let gpu_hud = format!(
+                    "GPU: {:.1}W | {:.2} GHz",
+                    s.gpu_power_w(),
+                    s.gpu_ghz()
+                );
+
+                let wide_cpu: Vec<u16> = cpu_hud.encode_utf16().collect();
+                let mut size_cpu = windows::Win32::Foundation::SIZE::default();
+                let _ = GetTextExtentPoint32W(hdc, &wide_cpu, &mut size_cpu);
+
+                let bullet = "   •   ";
+                let wide_bullet: Vec<u16> = bullet.encode_utf16().collect();
+                let mut size_bullet = windows::Win32::Foundation::SIZE::default();
+                let _ = GetTextExtentPoint32W(hdc, &wide_bullet, &mut size_bullet);
+
+                let x_bullet = hud_x + size_cpu.cx;
+                let x_gpu = x_bullet + size_bullet.cx;
+
+                draw_text_line(hdc, hud_x, hud_text_y, &cpu_hud, COLOR_CPU);
+                draw_text_line(hdc, x_bullet, hud_text_y, bullet, COLOR_TEXT_LIGHT);
+                draw_text_line(hdc, x_gpu, hud_text_y, &gpu_hud, COLOR_GPU);
+            }
         }
         None => {
-            draw_text_line(
-                hdc,
-                hud_x,
-                hud_text_y,
-                "CPU: --°C | --.-W | -.-- GHz   •   GPU: --°C | --.-W | -.-- GHz (Đang thu thập dữ liệu...)",
-                COLOR_TEXT_MUTED,
-            );
+            if state.active_mode == ChartMode::TempAndFan {
+                draw_text_line(
+                    hdc,
+                    hud_x,
+                    hud_text_y,
+                    "CPU: --°C  |  GPU: --°C  |  Main: -- (Đang thu thập dữ liệu...)",
+                    COLOR_TEXT_MUTED,
+                );
+            } else {
+                draw_text_line(
+                    hdc,
+                    hud_x,
+                    hud_text_y,
+                    "CPU: --.-W | -.-- GHz   •   GPU: --.-W | -.-- GHz (Đang thu thập dữ liệu...)",
+                    COLOR_TEXT_MUTED,
+                );
+            }
         }
     }
 
@@ -760,6 +804,8 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
 
         let mut cpu_pts: Vec<POINT> = Vec::with_capacity(samples.len());
         let mut gpu_pts: Vec<POINT> = Vec::with_capacity(samples.len());
+        let mut main_segments: Vec<Vec<POINT>> = Vec::new();
+        let mut current_main_seg: Vec<POINT> = Vec::new();
 
         for s in &samples {
             if let Some(x) = map_time_x(s.timestamp_secs, newest_ts, plot_left, plot_right) {
@@ -781,44 +827,89 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
                 cpu_pts.push(POINT { x, y: cpu_y });
                 gpu_pts.push(POINT { x, y: gpu_y });
 
+                if state.active_mode == ChartMode::TempAndFan {
+                    if s.system_temp > 0 {
+                        let main_y = map_temp_y(s.system_temp, plot_top, plot_bottom);
+                        current_main_seg.push(POINT { x, y: main_y });
+                    } else if !current_main_seg.is_empty() {
+                        main_segments.push(std::mem::take(&mut current_main_seg));
+                    }
+                }
+
                 mapped_samples.push((x, cpu_y, gpu_y, s));
             }
         }
 
-        // Vẽ đường GPU (Cam #FF9100, 2px)
+        if !current_main_seg.is_empty() {
+            main_segments.push(current_main_seg);
+        }
+
+        // 1. Z-Order 1: Đường nhiệt độ Mainboard (#BC8CFF, 2px) - Vẽ trước tiên (ở dưới cùng)
+        if state.active_mode == ChartMode::TempAndFan && !main_segments.is_empty() {
+            let main_pen = CreatePen(PS_SOLID, 2, COLOR_MAINBOARD);
+            let old_pen = SelectObject(hdc, main_pen);
+            for seg in &main_segments {
+                if seg.len() >= 2 {
+                    let _ = Polyline(hdc, seg);
+                } else if let Some(pt) = seg.first() {
+                    let _ = Ellipse(hdc, pt.x - 2, pt.y - 2, pt.x + 2, pt.y + 2);
+                }
+            }
+            let _ = SelectObject(hdc, old_pen);
+            let _ = DeleteObject(main_pen);
+
+            // Điểm chấm tròn hiện tại ở mép phải của Mainboard nếu mẫu mới nhất có system_temp > 0
+            if let Some(last_s) = samples.last() {
+                if last_s.system_temp > 0 {
+                    if let Some(last_seg) = main_segments.last() {
+                        if let Some(last_pt) = last_seg.last() {
+                            let main_brush = CreateSolidBrush(COLOR_MAINBOARD);
+                            let old_b = SelectObject(hdc, main_brush);
+                            let _ = Ellipse(hdc, last_pt.x - 3, last_pt.y - 3, last_pt.x + 4, last_pt.y + 4);
+                            let _ = SelectObject(hdc, old_b);
+                            let _ = DeleteObject(main_brush);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Z-Order 2: Đường GPU (Cam #FF9100, 2px)
         let gpu_pen = CreatePen(PS_SOLID, 2, COLOR_GPU);
-        let _ = SelectObject(hdc, gpu_pen);
+        let old_pen = SelectObject(hdc, gpu_pen);
         if gpu_pts.len() >= 2 {
             let _ = Polyline(hdc, &gpu_pts);
         } else if let Some(pt) = gpu_pts.first() {
             let _ = Ellipse(hdc, pt.x - 2, pt.y - 2, pt.x + 2, pt.y + 2);
         }
+        let _ = SelectObject(hdc, old_pen);
         let _ = DeleteObject(gpu_pen);
 
-        // Vẽ đường CPU (Cyan #00E5FF, 2px)
+        // 3. Z-Order 3: Đường CPU (Cyan #00E5FF, 2px) - Vẽ sau cùng (ở trên cùng nổi bật nhất)
         let cpu_pen = CreatePen(PS_SOLID, 2, COLOR_CPU);
-        let _ = SelectObject(hdc, cpu_pen);
+        let old_pen = SelectObject(hdc, cpu_pen);
         if cpu_pts.len() >= 2 {
             let _ = Polyline(hdc, &cpu_pts);
         } else if let Some(pt) = cpu_pts.first() {
             let _ = Ellipse(hdc, pt.x - 2, pt.y - 2, pt.x + 2, pt.y + 2);
         }
+        let _ = SelectObject(hdc, old_pen);
         let _ = DeleteObject(cpu_pen);
 
         // Điểm chấm tròn hiện tại ở mép phải
-        if let Some(last_cpu) = cpu_pts.last() {
-            let cpu_brush = CreateSolidBrush(COLOR_CPU);
-            let old_b = SelectObject(hdc, cpu_brush);
-            let _ = Ellipse(hdc, last_cpu.x - 3, last_cpu.y - 3, last_cpu.x + 4, last_cpu.y + 4);
-            let _ = SelectObject(hdc, old_b);
-            let _ = DeleteObject(cpu_brush);
-        }
         if let Some(last_gpu) = gpu_pts.last() {
             let gpu_brush = CreateSolidBrush(COLOR_GPU);
             let old_b = SelectObject(hdc, gpu_brush);
             let _ = Ellipse(hdc, last_gpu.x - 3, last_gpu.y - 3, last_gpu.x + 4, last_gpu.y + 4);
             let _ = SelectObject(hdc, old_b);
             let _ = DeleteObject(gpu_brush);
+        }
+        if let Some(last_cpu) = cpu_pts.last() {
+            let cpu_brush = CreateSolidBrush(COLOR_CPU);
+            let old_b = SelectObject(hdc, cpu_brush);
+            let _ = Ellipse(hdc, last_cpu.x - 3, last_cpu.y - 3, last_cpu.x + 4, last_cpu.y + 4);
+            let _ = SelectObject(hdc, old_b);
+            let _ = DeleteObject(cpu_brush);
         }
     }
 
@@ -828,20 +919,24 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
             if let Some(&(closest_x, cpu_y, gpu_y, sample)) = mapped_samples.iter().min_by_key(|(x, _, _, _)| (x - m_pos.x).abs()) {
                 // Đường gióng dọc Crosshair
                 let cross_pen = CreatePen(PS_DOT, 1, COLOR_CROSSHAIR);
-                let _ = SelectObject(hdc, cross_pen);
+                let old_pen = SelectObject(hdc, cross_pen);
                 let cross_pts = [
                     POINT { x: closest_x, y: plot_top },
                     POINT { x: closest_x, y: plot_bottom },
                 ];
                 let _ = Polyline(hdc, &cross_pts);
+                let _ = SelectObject(hdc, old_pen);
                 let _ = DeleteObject(cross_pen);
 
-                // Điểm giao điểm trên đường CPU
-                let cpu_dot_brush = CreateSolidBrush(COLOR_CPU);
-                let old_b = SelectObject(hdc, cpu_dot_brush);
-                let _ = Ellipse(hdc, closest_x - 4, cpu_y - 4, closest_x + 5, cpu_y + 5);
-                let _ = SelectObject(hdc, old_b);
-                let _ = DeleteObject(cpu_dot_brush);
+                // Điểm giao điểm trên đường Mainboard (nếu trong tab TempAndFan và system_temp > 0)
+                if state.active_mode == ChartMode::TempAndFan && sample.system_temp > 0 {
+                    let main_y = map_temp_y(sample.system_temp, plot_top, plot_bottom);
+                    let main_dot_brush = CreateSolidBrush(COLOR_MAINBOARD);
+                    let old_b = SelectObject(hdc, main_dot_brush);
+                    let _ = Ellipse(hdc, closest_x - 4, main_y - 4, closest_x + 5, main_y + 5);
+                    let _ = SelectObject(hdc, old_b);
+                    let _ = DeleteObject(main_dot_brush);
+                }
 
                 // Điểm giao điểm trên đường GPU
                 let gpu_dot_brush = CreateSolidBrush(COLOR_GPU);
@@ -849,6 +944,13 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
                 let _ = Ellipse(hdc, closest_x - 4, gpu_y - 4, closest_x + 5, gpu_y + 5);
                 let _ = SelectObject(hdc, old_b);
                 let _ = DeleteObject(gpu_dot_brush);
+
+                // Điểm giao điểm trên đường CPU
+                let cpu_dot_brush = CreateSolidBrush(COLOR_CPU);
+                let old_b = SelectObject(hdc, cpu_dot_brush);
+                let _ = Ellipse(hdc, closest_x - 4, cpu_y - 4, closest_x + 5, cpu_y + 5);
+                let _ = SelectObject(hdc, old_b);
+                let _ = DeleteObject(cpu_dot_brush);
 
                 // Tính toán thông tin hiển thị Tooltip theo Chế độ hiện tại
                 let newest_ts = samples.last().map(|s| s.timestamp_secs).unwrap_or(0);
@@ -861,27 +963,40 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
                     format!("-{}m {:02}s trước", k / 60, k % 60)
                 };
 
-                let (line_cpu, line_gpu) = match state.active_mode {
-                    ChartMode::TempAndFan => (
-                        format!("CPU: {}°C (Quạt: {}%)", sample.cpu_temp, sample.cpu_fan_pct),
-                        format!("GPU: {}°C (Quạt: {}%)", sample.gpu_temp, sample.gpu_fan_pct),
-                    ),
+                let (line_cpu, line_gpu, line_main_opt) = match state.active_mode {
+                    ChartMode::TempAndFan => {
+                        let l_cpu = format!("CPU: {}°C (Quạt: {}%)", sample.cpu_temp, sample.cpu_fan_pct);
+                        let l_gpu = format!("GPU: {}°C (Quạt: {}%)", sample.gpu_temp, sample.gpu_fan_pct);
+                        let l_main = if sample.system_temp > 0 {
+                            format!("Main: {}°C", sample.system_temp)
+                        } else {
+                            "Main: --".to_string()
+                        };
+                        (l_cpu, l_gpu, Some(l_main))
+                    }
                     ChartMode::Power => (
                         format!("CPU: {:.1} W (Quạt: {}%)", sample.cpu_power_w(), sample.cpu_fan_pct),
                         format!("GPU: {:.1} W (Quạt: {}%)", sample.gpu_power_w(), sample.gpu_fan_pct),
+                        None,
                     ),
                     ChartMode::Clock => (
                         format!("CPU: {:.2} GHz ({} MHz)", sample.cpu_ghz(), sample.cpu_mhz),
                         format!("GPU: {:.2} GHz ({} MHz)", sample.gpu_ghz(), sample.gpu_mhz),
+                        None,
                     ),
                 };
 
                 // Vẽ hộp Tooltip thích ứng DPI
                 let tooltip_font = create_chart_dpi_font(dpi, 11.5, FW_SEMIBOLD.0 as i32);
-                let _ = SelectObject(hdc, tooltip_font);
+                let old_font = SelectObject(hdc, tooltip_font);
 
-                let tt_w = scale_dpi(205, dpi);
-                let tt_h = scale_dpi(86, dpi);
+                let tt_w = scale_dpi(215, dpi);
+                let tt_h = if line_main_opt.is_some() {
+                    scale_dpi(110, dpi) // 4 dòng khi có Mainboard
+                } else {
+                    scale_dpi(86, dpi)  // 3 dòng cho Power / Clock
+                };
+
                 let mut tt_x = closest_x + scale_dpi(15, dpi);
                 let mut tt_y = m_pos.y - (tt_h / 2);
 
@@ -907,7 +1022,7 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
                 let _ = DeleteObject(tt_brush);
 
                 let tt_border_pen = CreatePen(PS_SOLID, 1, COLOR_TOOLTIP_BORDER);
-                let _ = SelectObject(hdc, tt_border_pen);
+                let old_tt_pen = SelectObject(hdc, tt_border_pen);
                 let tt_box_pts = [
                     POINT { x: tt_x, y: tt_y },
                     POINT { x: tt_x + tt_w, y: tt_y },
@@ -916,14 +1031,46 @@ unsafe fn paint_chart(hdc: HDC, width: i32, height: i32, state: &ChartWindowStat
                     POINT { x: tt_x, y: tt_y },
                 ];
                 let _ = Polyline(hdc, &tt_box_pts);
+                let _ = SelectObject(hdc, old_tt_pen);
                 let _ = DeleteObject(tt_border_pen);
 
                 let pad = scale_dpi(10, dpi);
                 let line_h = scale_dpi(23, dpi);
-                draw_text_line(hdc, tt_x + pad, tt_y + pad, &time_str, COLOR_TEXT_LIGHT);
-                draw_text_line(hdc, tt_x + pad, tt_y + pad + line_h, &line_cpu, COLOR_CPU);
-                draw_text_line(hdc, tt_x + pad, tt_y + pad + line_h * 2, &line_gpu, COLOR_GPU);
 
+                // Dòng 1: Thời gian
+                draw_text_line(hdc, tt_x + pad, tt_y + pad, &time_str, COLOR_TEXT_LIGHT);
+
+                // Helper vẽ dòng tooltip kèm chấm tròn màu nhận diện
+                let draw_tooltip_metric = |hdc: HDC, y: i32, text: &str, color: COLORREF| {
+                    let dot_r = scale_dpi(3, dpi).max(2);
+                    let dot_x = tt_x + pad + dot_r;
+                    let dot_y = y + line_h / 2;
+                    let brush = CreateSolidBrush(color);
+                    let pen = CreatePen(PS_SOLID, 1, color);
+                    let old_p = SelectObject(hdc, pen);
+                    let old_b = SelectObject(hdc, brush);
+                    let _ = Ellipse(hdc, dot_x - dot_r, dot_y - dot_r, dot_x + dot_r + 1, dot_y + dot_r + 1);
+                    let _ = SelectObject(hdc, old_b);
+                    let _ = SelectObject(hdc, old_p);
+                    let _ = DeleteObject(brush);
+                    let _ = DeleteObject(pen);
+
+                    let text_x = dot_x + dot_r + scale_dpi(6, dpi);
+                    draw_text_line(hdc, text_x, y, text, color);
+                };
+
+                // Dòng 2: CPU kèm chấm Cyan
+                draw_tooltip_metric(hdc, tt_y + pad + line_h, &line_cpu, COLOR_CPU);
+
+                // Dòng 3: GPU kèm chấm Cam
+                draw_tooltip_metric(hdc, tt_y + pad + line_h * 2, &line_gpu, COLOR_GPU);
+
+                // Dòng 4: Mainboard kèm chấm Tím Neon #BC8CFF (dưới dòng GPU)
+                if let Some(ref line_main) = line_main_opt {
+                    draw_tooltip_metric(hdc, tt_y + pad + line_h * 3, line_main, COLOR_MAINBOARD);
+                }
+
+                let _ = SelectObject(hdc, old_font);
                 let _ = DeleteObject(tooltip_font);
             }
         }
@@ -1271,8 +1418,8 @@ mod tests {
         // Sau khi đẩy dữ liệu với đầy đủ thông số (nhiệt độ, quạt, công suất, xung nhịp)
         {
             let mut hist = telemetry.lock().unwrap();
-            hist.push_with_timestamp(100, 48, 42, 35, 30, 420, 190, 3800, 2200);
-            hist.push_with_timestamp(101, 52, 45, 40, 35, 450, 210, 4200, 2300);
+            hist.push_with_timestamp(100, 48, 42, 50, 35, 30, 420, 190, 3800, 2200);
+            hist.push_with_timestamp(101, 52, 45, 52, 40, 35, 450, 210, 4200, 2300);
         }
 
         {
@@ -1283,6 +1430,9 @@ mod tests {
             assert_eq!(stats.cpu_min, 48);
             assert_eq!(stats.cpu_max, 52);
             assert_eq!(stats.gpu_current, 45);
+            assert_eq!(stats.system_current, 52);
+            assert_eq!(stats.system_min, 50);
+            assert_eq!(stats.system_max, 52);
             assert_eq!(stats.cpu_power_current, 450);
             assert_eq!(stats.gpu_power_current, 210);
             assert_eq!(stats.cpu_mhz_current, 4200);
@@ -1337,5 +1487,41 @@ mod tests {
 
         // Ngoài vùng tab tại 120 DPI
         assert_eq!(hit_test_tab_dpi(0, 0, 120), None);
+    }
+
+    #[test]
+    fn test_neon_violet_color_ref() {
+        // Kiểm tra Win32 COLORREF BGR: RGB(188, 140, 255) -> 0x00FF8CBC
+        assert_eq!(COLOR_MAINBOARD.0, 0x00FF8CBC);
+    }
+
+    #[test]
+    fn test_mainboard_temp_discontinuous_segments() {
+        // Kiểm tra xử lý ngắt đoạn (Discontinuous): khi system_temp == 0 thì ngắt nét không vẽ cắm xuống đáy
+        let samples = [
+            TelemetrySample { timestamp_secs: 100, system_temp: 50, ..Default::default() },
+            TelemetrySample { timestamp_secs: 101, system_temp: 52, ..Default::default() },
+            TelemetrySample { timestamp_secs: 102, system_temp: 0, ..Default::default() }, // Mất cảm biến / N/A
+            TelemetrySample { timestamp_secs: 103, system_temp: 55, ..Default::default() },
+            TelemetrySample { timestamp_secs: 104, system_temp: 56, ..Default::default() },
+        ];
+
+        let mut segments: Vec<Vec<u8>> = Vec::new();
+        let mut curr_seg: Vec<u8> = Vec::new();
+
+        for s in &samples {
+            if s.system_temp > 0 {
+                curr_seg.push(s.system_temp);
+            } else if !curr_seg.is_empty() {
+                segments.push(std::mem::take(&mut curr_seg));
+            }
+        }
+        if !curr_seg.is_empty() {
+            segments.push(curr_seg);
+        }
+
+        assert_eq!(segments.len(), 2, "Phải tách thành 2 đoạn riêng biệt khi có mẫu 0°C");
+        assert_eq!(segments[0], vec![50, 52]);
+        assert_eq!(segments[1], vec![55, 56]);
     }
 }
