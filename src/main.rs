@@ -383,15 +383,16 @@ fn main() {
             );
         }
 
-        // Khởi tạo Smooth EPP Thermal Governor (Intel Speed Shift - Zero Stuttering)
+        // Khởi tạo 2-Phase Dynamic Thermal Governor (Khóa trần có điều kiện & Tự động xả xung khi mát)
         let mut governor = ThermalGovernor::new((&worker_config.thermal_governor).into());
         worker_tray_handle.update_governor_status(
             governor.config.enabled,
             governor.config.target_temp,
-            governor.current_epp,
+            governor.is_capped(),
+            governor.resolve_cap_mhz(),
         );
-        println!("[GOVERNOR] Initialized Smooth EPP Thermal Governor (Target: {}°C, Max EPP: {}, Enabled: {})",
-            governor.config.target_temp, governor.config.max_epp, governor.config.enabled);
+        println!("[GOVERNOR] Initialized 2-Phase Dynamic Thermal Governor (Target: {}°C, Cap: {} MHz, Enabled: {})",
+            governor.config.target_temp, governor.resolve_cap_mhz(), governor.config.enabled);
 
         let mut last_watchdog_refresh = Instant::now();
         let mut tick_count: u64 = 0;
@@ -430,11 +431,12 @@ fn main() {
                         let reloaded = Config::load_or_default(&config_path);
                         println!("[CONFIG] Hot-reloaded configuration from '{}' successfully (poll: {}ms)",
                             config_path.display(), reloaded.poll_interval_ms);
-                        governor.config = (&reloaded.thermal_governor).into();
+                        governor.set_config(reloaded.thermal_governor.enabled, reloaded.thermal_governor.target_cpu_temp);
                         worker_tray_handle.update_governor_status(
                             governor.config.enabled,
                             governor.config.target_temp,
-                            governor.current_epp,
+                            governor.is_capped(),
+                            governor.resolve_cap_mhz(),
                         );
                         worker_config = reloaded;
                         last_cpu_speed = 255;
@@ -447,16 +449,18 @@ fn main() {
                         // Cửa sổ biểu đồ được mở độc lập trên UI thread
                     }
                     TrayCommand::ToggleGovernor => {
-                        governor.config.enabled = !governor.config.enabled;
-                        if !governor.config.enabled {
+                        let new_enabled = !governor.config.enabled;
+                        governor.set_config(new_enabled, governor.config.target_temp);
+                        if !new_enabled {
                             governor.reset_to_maximum();
                         }
                         worker_tray_handle.update_governor_status(
                             governor.config.enabled,
                             governor.config.target_temp,
-                            governor.current_epp,
+                            governor.is_capped(),
+                            governor.resolve_cap_mhz(),
                         );
-                        println!("[GOVERNOR] Smooth EPP Thermal Governor toggled to: {}", if governor.config.enabled { "ENABLED" } else { "DISABLED" });
+                        println!("[GOVERNOR] 2-Phase Dynamic Thermal Governor toggled to: {}", if governor.config.enabled { "ENABLED" } else { "DISABLED" });
                     }
                     TrayCommand::Exit => {
                         println!("[COMMAND] Exit requested from System Tray menu.");
@@ -482,11 +486,12 @@ fn main() {
             // ========================================================================
             // Đọc trực tiếp qua WMI ACPI ThermalZone không phân bổ bộ nhớ (0 allocation)
             let fast_cpu_temp = telemetry_reader.read_cpu_temp().unwrap_or(telemetry_reader.last_cpu_temp());
-            let current_epp = governor.update(fast_cpu_temp);
+            let _phase = governor.evaluate(fast_cpu_temp as f32);
             worker_tray_handle.update_governor_status(
                 governor.config.enabled,
                 governor.config.target_temp,
-                current_epp,
+                governor.is_capped(),
+                governor.resolve_cap_mhz(),
             );
 
             // ========================================================================
@@ -577,8 +582,8 @@ fn main() {
             }
         }
 
-        // 7. Hardware Fail-Safe: Khôi phục quạt về chế độ Tự động (BIOS Auto) và phục hồi EPP = 0, PROCTHROTTLEMAX = 100% trước khi thoát luồng
-        println!("[FAIL-SAFE] Reverting Thermal Governor EPP to 0 (Max Performance) and PROCTHROTTLEMAX to 100%...");
+        // 7. Hardware Fail-Safe: Khôi phục quạt về chế độ Tự động (BIOS Auto) và phục hồi PROCFREQMAX = 0 (Full 4.90 GHz), EPP = 25, PROCTHROTTLEMAX = 100% trước khi thoát luồng
+        println!("[FAIL-SAFE] Reverting Thermal Governor: PROCFREQMAX = 0 (Full 4.90 GHz), EPP = 25, PROCTHROTTLEMAX = 100%...");
         governor.reset_to_maximum();
         println!("[FAIL-SAFE] Setting hardware fan controller to BIOS Auto mode...");
         backend.set_auto_mode();

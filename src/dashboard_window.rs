@@ -144,6 +144,7 @@ pub struct TactileButton {
     pub state: ButtonState,
     pub is_active: bool,
     pub is_danger: bool,
+    pub is_warning: bool,
 }
 
 /// Bản chụp trạng thái tức thời không khóa (Zero-Contention Snapshot)
@@ -164,6 +165,8 @@ pub struct DashboardSnapshot {
     pub governor_enabled: bool,
     pub governor_target_temp: u32,
     pub governor_epp: u32,
+    pub governor_is_capped: bool,
+    pub governor_cap_mhz: u32,
     pub reload_flash_ticks: u8,
 }
 
@@ -184,7 +187,9 @@ impl Default for DashboardSnapshot {
             active_profile: FanProfile::ActiveCurve,
             governor_enabled: true,
             governor_target_temp: 80,
-            governor_epp: 0,
+            governor_epp: 25,
+            governor_is_capped: false,
+            governor_cap_mhz: 0,
             reload_flash_ticks: 0,
         }
     }
@@ -194,7 +199,7 @@ impl DashboardSnapshot {
     pub fn from_state(state: &TrayState, reload_flash_ticks: u8) -> Self {
         let (cpu_temp, cpu_speed, gpu_temp, gpu_speed, cpu_rpm, gpu_rpm) = state.get_status_rpm();
         let (cpu_power_dw, gpu_power_dw, cpu_mhz, gpu_mhz) = state.get_metrics();
-        let (governor_enabled, governor_target_temp, governor_epp) = state.get_governor_info();
+        let (governor_enabled, governor_target_temp, governor_is_capped, governor_cap_mhz) = state.get_governor_info();
         let active_profile = state.get_profile();
         let system_temp = state.system_temp.load(Ordering::Relaxed);
 
@@ -213,7 +218,9 @@ impl DashboardSnapshot {
             active_profile,
             governor_enabled,
             governor_target_temp,
-            governor_epp,
+            governor_epp: if governor_is_capped { 65 } else { 25 },
+            governor_is_capped,
+            governor_cap_mhz,
             reload_flash_ticks,
         }
     }
@@ -371,7 +378,7 @@ pub fn compute_dashboard_layout(
         right: w - 16,
         bottom: epp_y_bottom,
     };
-    let epp_btn_w = 148;
+    let epp_btn_w = 168;
     let epp_btn_h = 32.min(epp_h - 4);
     let epp_btn_top = epp_y_top + (epp_h - epp_btn_h) / 2;
     let epp_btn_right = w - 24;
@@ -382,10 +389,19 @@ pub fn compute_dashboard_layout(
         right: epp_btn_right,
         bottom: epp_btn_top + epp_btn_h,
     };
-    let epp_label = if snapshot.governor_enabled {
-        format!("BẬT • {}°C", snapshot.governor_target_temp)
+    let (epp_label, epp_is_warning) = if snapshot.governor_enabled {
+        if snapshot.governor_is_capped {
+            let cap_str = if snapshot.governor_cap_mhz > 0 {
+                format!("{:.1} GHz", snapshot.governor_cap_mhz as f32 / 1000.0)
+            } else {
+                "3.8 GHz".to_string()
+            };
+            (format!("HÃM NHIỆT ({})", cap_str), true)
+        } else {
+            (format!("BẬT ({}°C)", snapshot.governor_target_temp), false)
+        }
     } else {
-        "TẮT".to_string()
+        ("TẮT".to_string(), false)
     };
 
     // --- Tools Grid ---
@@ -405,6 +421,7 @@ pub fn compute_dashboard_layout(
         state: get_state(ButtonId::ToggleTheme),
         is_active: false,
         is_danger: false,
+        is_warning: false,
     });
 
     buttons.push(TactileButton {
@@ -414,6 +431,7 @@ pub fn compute_dashboard_layout(
         state: get_state(ButtonId::ProfileCurve),
         is_active: snapshot.active_profile == FanProfile::ActiveCurve,
         is_danger: false,
+        is_warning: false,
     });
 
     buttons.push(TactileButton {
@@ -423,6 +441,7 @@ pub fn compute_dashboard_layout(
         state: get_state(ButtonId::ProfileTurbo),
         is_active: snapshot.active_profile == FanProfile::Turbo,
         is_danger: false,
+        is_warning: false,
     });
 
     buttons.push(TactileButton {
@@ -432,6 +451,7 @@ pub fn compute_dashboard_layout(
         state: get_state(ButtonId::ProfileSilent),
         is_active: snapshot.active_profile == FanProfile::Silent,
         is_danger: false,
+        is_warning: false,
     });
 
     buttons.push(TactileButton {
@@ -441,6 +461,7 @@ pub fn compute_dashboard_layout(
         state: get_state(ButtonId::ToggleEpp),
         is_active: snapshot.governor_enabled,
         is_danger: false,
+        is_warning: epp_is_warning,
     });
 
     buttons.push(TactileButton {
@@ -455,6 +476,7 @@ pub fn compute_dashboard_layout(
         state: get_state(ButtonId::OpenCurveEditor),
         is_active: false,
         is_danger: false,
+        is_warning: false,
     });
 
     buttons.push(TactileButton {
@@ -469,6 +491,7 @@ pub fn compute_dashboard_layout(
         state: get_state(ButtonId::OpenTelemetryChart),
         is_active: false,
         is_danger: false,
+        is_warning: false,
     });
 
     buttons.push(TactileButton {
@@ -483,6 +506,7 @@ pub fn compute_dashboard_layout(
         state: get_state(ButtonId::ReloadConfig),
         is_active: false,
         is_danger: false,
+        is_warning: false,
     });
 
     buttons.push(TactileButton {
@@ -497,6 +521,7 @@ pub fn compute_dashboard_layout(
         state: get_state(ButtonId::ExitApp),
         is_active: false,
         is_danger: true,
+        is_warning: false,
     });
 
     DashboardLayout {
@@ -1022,10 +1047,18 @@ unsafe fn draw_tactile_toggle_switch(
 
     // 2. Màu sắc thanh ray theo trạng thái BẬT/TẮT và Hover/Pressed
     let (track_bg, track_border, border_width) = if btn.is_active {
-        match btn.state {
-            ButtonState::Hovered => (palette.cpu, rgb(180, 248, 255), 2),
-            ButtonState::Pressed => (palette.active_bg, palette.cpu, 2),
-            ButtonState::Normal => (palette.cpu, rgb(128, 242, 255), 1),
+        if btn.is_warning {
+            match btn.state {
+                ButtonState::Hovered => (rgb(245, 158, 11), rgb(255, 215, 128), 2),
+                ButtonState::Pressed => (palette.active_bg, rgb(245, 158, 11), 2),
+                ButtonState::Normal => (rgb(245, 158, 11), rgb(255, 190, 92), 1),
+            }
+        } else {
+            match btn.state {
+                ButtonState::Hovered => (palette.cpu, rgb(180, 248, 255), 2),
+                ButtonState::Pressed => (palette.active_bg, palette.cpu, 2),
+                ButtonState::Normal => (palette.cpu, rgb(128, 242, 255), 1),
+            }
         }
     } else {
         match btn.state {
@@ -1097,7 +1130,11 @@ unsafe fn draw_tactile_toggle_switch(
     };
 
     let (text_color, chosen_font) = if btn.is_active {
-        (palette.cpu, font_bold)
+        if btn.is_warning {
+            (rgb(255, 179, 71), font_bold)
+        } else {
+            (palette.cpu, font_bold)
+        }
     } else {
         (palette.text_sec, font_normal)
     };
@@ -1148,6 +1185,12 @@ unsafe fn draw_tactile_button(
             ButtonState::Hovered => (palette.btn_hover, palette.danger, 2),
             ButtonState::Normal => (palette.btn_norm, palette.border, 1),
         }
+    } else if btn.is_warning {
+        match btn.state {
+            ButtonState::Pressed => (palette.btn_pressed, rgb(245, 158, 11), 2),
+            ButtonState::Hovered => (palette.active_bg, rgb(245, 158, 11), 2),
+            ButtonState::Normal => (palette.active_bg, rgb(245, 158, 11), 2),
+        }
     } else if btn.is_active {
         match btn.state {
             ButtonState::Pressed => (palette.btn_pressed, palette.cpu, 2),
@@ -1186,6 +1229,8 @@ unsafe fn draw_tactile_button(
     // Vẽ nhãn chữ giữa nút
     let text_color = if btn.is_danger && (btn.state == ButtonState::Hovered || btn.state == ButtonState::Pressed) {
         palette.danger
+    } else if btn.is_warning {
+        rgb(255, 179, 71)
     } else if btn.is_active {
         palette.cpu
     } else {
@@ -1346,26 +1391,60 @@ unsafe fn paint_dashboard(
     let _ = DeleteObject(epp_brush);
     let _ = DeleteObject(epp_pen);
 
-    // Tiêu đề EPP Governor với clipping không bao giờ đè nút Toggle:
+    // Tiêu đề EPP Governor và nhãn trạng thái pha với clipping không bao giờ đè nút Toggle:
     let epp_text_right = layout
         .buttons
         .iter()
         .find(|b| b.id == ButtonId::ToggleEpp)
         .map(|b| b.rect.left - 12)
-        .unwrap_or(width - 170);
+        .unwrap_or(width - 190);
 
-    let epp_text_rect = RECT {
+    let panel_h = epp_panel_rect.bottom - epp_panel_rect.top;
+    let mid_y = epp_panel_rect.top + (panel_h / 2);
+
+    let epp_title_rect = RECT {
         left: 28,
-        top: epp_panel_rect.top,
+        top: epp_panel_rect.top + 3,
         right: epp_text_right.max(28),
-        bottom: epp_panel_rect.bottom,
+        bottom: mid_y + 1,
     };
+    let epp_status_rect = RECT {
+        left: 28,
+        top: mid_y - 1,
+        right: epp_text_right.max(28),
+        bottom: epp_panel_rect.bottom - 3,
+    };
+
     let _ = SelectObject(hdc, font_btn_bold);
     draw_text_clipped(
         hdc,
-        epp_text_rect,
+        epp_title_rect,
         "Khóa nhiệt độ CPU (Smooth EPP Governor)",
         palette.text,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+    );
+
+    let (status_text, status_color) = if snapshot.governor_enabled {
+        if snapshot.governor_is_capped {
+            let cap_str = if snapshot.governor_cap_mhz > 0 {
+                format!("{:.1} GHz", snapshot.governor_cap_mhz as f32 / 1000.0)
+            } else {
+                "3.8 GHz".to_string()
+            };
+            (format!("HÃM NHIỆT ({}) - Tạm thời bảo vệ máy", cap_str), rgb(255, 179, 71))
+        } else {
+            ("Mát máy: Xả xung tối đa (4.9 GHz)".to_string(), palette.cpu)
+        }
+    } else {
+        ("Đã tắt bộ điều phối nhiệt độ CPU".to_string(), palette.text_sec)
+    };
+
+    let _ = SelectObject(hdc, font_sub_metric);
+    draw_text_clipped(
+        hdc,
+        epp_status_rect,
+        &status_text,
+        status_color,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
     );
 
@@ -1742,6 +1821,8 @@ mod tests {
             governor_enabled: true,
             governor_target_temp: 80,
             governor_epp: 96,
+            governor_is_capped: false,
+            governor_cap_mhz: 0,
             reload_flash_ticks: 0,
         };
 
@@ -1776,11 +1857,11 @@ mod tests {
         assert_eq!(curve_btn.state, ButtonState::Normal);
         assert!(!curve_btn.is_active);
 
-        // Nút Toggle EPP (Pill Toggle Switch) phải có is_active = true, label chứa 80°C, width 148px, height 32px
+        // Nút Toggle EPP (Pill Toggle Switch) phải có is_active = true, label chứa 80°C, width 168px, height 32px
         let epp_btn = buttons.iter().find(|b| b.id == ButtonId::ToggleEpp).unwrap();
         assert!(epp_btn.is_active);
         assert!(epp_btn.label.contains("80°C"));
-        assert_eq!(epp_btn.rect.right - epp_btn.rect.left, 148);
+        assert_eq!(epp_btn.rect.right - epp_btn.rect.left, 168);
         assert_eq!(epp_btn.rect.bottom - epp_btn.rect.top, 32);
 
         // Nút ExitApp phải có is_danger = true, chiều cao từ 38 đến 44 px
@@ -1804,17 +1885,32 @@ mod tests {
         let btns_on = compute_button_layout(600, 500, &snap_on, AppTheme::Dark, None, None);
         let toggle_on = btns_on.iter().find(|b| b.id == ButtonId::ToggleEpp).unwrap();
         assert!(toggle_on.is_active);
-        assert_eq!(toggle_on.label, "BẬT • 75°C");
-        assert_eq!(toggle_on.rect.right - toggle_on.rect.left, 148);
+        assert!(!toggle_on.is_warning);
+        assert_eq!(toggle_on.label, "BẬT (75°C)");
+        assert_eq!(toggle_on.rect.right - toggle_on.rect.left, 168);
         assert_eq!(toggle_on.rect.bottom - toggle_on.rect.top, 32);
 
         // 2. Kiểm tra trạng thái TẮT (OFF)
         let btns_off = compute_button_layout(600, 500, &snap_off, AppTheme::Dark, None, None);
         let toggle_off = btns_off.iter().find(|b| b.id == ButtonId::ToggleEpp).unwrap();
         assert!(!toggle_off.is_active);
+        assert!(!toggle_off.is_warning);
         assert_eq!(toggle_off.label, "TẮT");
-        assert_eq!(toggle_off.rect.right - toggle_off.rect.left, 148);
+        assert_eq!(toggle_off.rect.right - toggle_off.rect.left, 168);
         assert_eq!(toggle_off.rect.bottom - toggle_off.rect.top, 32);
+
+        // 2b. Kiểm tra trạng thái HÃM NHIỆT (Capped Cooling)
+        let mut snap_capped = DashboardSnapshot::default();
+        snap_capped.governor_enabled = true;
+        snap_capped.governor_target_temp = 80;
+        snap_capped.governor_is_capped = true;
+        snap_capped.governor_cap_mhz = 3800;
+
+        let btns_capped = compute_button_layout(600, 500, &snap_capped, AppTheme::Dark, None, None);
+        let toggle_capped = btns_capped.iter().find(|b| b.id == ButtonId::ToggleEpp).unwrap();
+        assert!(toggle_capped.is_active);
+        assert!(toggle_capped.is_warning);
+        assert_eq!(toggle_capped.label, "HÃM NHIỆT (3.8 GHz)");
 
         // 3. Kiểm tra Hit-testing bao phủ toàn bộ cụm: nhãn chữ bên trái và thanh gạt bên phải
         // Điểm ở góc trái (vùng nhãn chữ)
@@ -1842,7 +1938,7 @@ mod tests {
         let state = Arc::new(TrayState::new());
         state.update_status(72, 60, 68, 55, 3600, 3400);
         state.update_metrics(428, 195, 3820, 2250);
-        state.update_governor_status(true, 85, 128);
+        state.update_governor_status(true, 85, true, 3800);
         state.set_profile(FanProfile::Silent);
 
         let snap = DashboardSnapshot::from_state(&state, 2);
@@ -1859,7 +1955,8 @@ mod tests {
         assert_eq!(snap.active_profile, FanProfile::Silent);
         assert!(snap.governor_enabled);
         assert_eq!(snap.governor_target_temp, 85);
-        assert_eq!(snap.governor_epp, 128);
+        assert!(snap.governor_is_capped);
+        assert_eq!(snap.governor_cap_mhz, 3800);
         assert_eq!(snap.reload_flash_ticks, 2);
     }
 
@@ -1914,6 +2011,8 @@ mod tests {
             governor_enabled: true,
             governor_target_temp: 85,
             governor_epp: 96,
+            governor_is_capped: false,
+            governor_cap_mhz: 0,
             reload_flash_ticks: 0,
         };
 

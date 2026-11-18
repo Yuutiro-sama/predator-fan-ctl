@@ -724,8 +724,8 @@ unsafe fn save_and_apply_curve(hwnd: HWND, controls: &DialogControls) {
         Ok(_) => {
             // Cập nhật governor status trên TrayState
             if let Some(ref st) = controls.state {
-                let (_, _, curr_epp) = st.get_governor_info();
-                st.update_governor_status(config.thermal_governor.enabled, config.thermal_governor.target_cpu_temp, curr_epp);
+                let (_, _, is_capped, cap_mhz) = st.get_governor_info();
+                st.update_governor_status(config.thermal_governor.enabled, config.thermal_governor.target_cpu_temp, is_capped, cap_mhz);
             }
 
             // Gửi lệnh hot-reload tới Worker thread điều khiển quạt
@@ -802,12 +802,17 @@ unsafe extern "system" fn dialog_wndproc(
             if let Some(controls) = ptr.as_mut() {
                 if let Some(ref st) = controls.state {
                     let (cpu_t, cpu_s, gpu_t, gpu_s, cpu_rpm, gpu_rpm) = st.get_status_rpm();
-                    let (gov_en, gov_tgt, gov_epp) = st.get_governor_info();
+                    let (gov_en, gov_tgt, is_capped, cap_mhz) = st.get_governor_info();
                     let gov_str = if gov_en {
-                        if gov_epp == 0 {
-                            format!(" | Thermal Target: {}°C (EPP: 0 - Boost)", gov_tgt)
+                        if is_capped {
+                            let cap_str = if cap_mhz > 0 {
+                                format!("{:.1} GHz", cap_mhz as f32 / 1000.0)
+                            } else {
+                                "3.8 GHz".to_string()
+                            };
+                            format!(" | Thermal Target: {}°C (Capped {})", gov_tgt, cap_str)
                         } else {
-                            format!(" | Thermal Target: {}°C (EPP: {})", gov_tgt, gov_epp)
+                            format!(" | Thermal Target: {}°C (Unlocked 4.90 GHz)", gov_tgt)
                         }
                     } else {
                         " | Thermal Target: OFF".to_string()

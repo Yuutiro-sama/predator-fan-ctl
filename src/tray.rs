@@ -110,6 +110,8 @@ pub struct TrayState {
     pub governor_enabled: AtomicBool,
     pub governor_target_temp: AtomicU32,
     pub governor_epp: AtomicU32,
+    pub governor_is_capped: AtomicBool,
+    pub governor_cap_mhz: AtomicU32,
     pub cpu_power_dw: AtomicU32,
     pub gpu_power_dw: AtomicU32,
     pub cpu_mhz: AtomicU32,
@@ -129,7 +131,9 @@ impl Default for TrayState {
             active_profile: AtomicU8::new(FanProfile::ActiveCurve.to_u8()),
             governor_enabled: AtomicBool::new(true),
             governor_target_temp: AtomicU32::new(80),
-            governor_epp: AtomicU32::new(0),
+            governor_epp: AtomicU32::new(25),
+            governor_is_capped: AtomicBool::new(false),
+            governor_cap_mhz: AtomicU32::new(0),
             cpu_power_dw: AtomicU32::new(0),
             gpu_power_dw: AtomicU32::new(0),
             cpu_mhz: AtomicU32::new(0),
@@ -185,14 +189,20 @@ impl TrayState {
         self.update_metrics(cpu_power_dw, gpu_power_dw, cpu_mhz, gpu_mhz);
     }
 
-    pub fn update_governor_status(&self, enabled: bool, target_temp: u32, epp: u32) {
+    pub fn update_governor_status(&self, enabled: bool, target_temp: u32, is_capped: bool, cap_mhz: u32) {
         self.governor_enabled.store(enabled, Ordering::Relaxed);
         self.governor_target_temp.store(target_temp, Ordering::Relaxed);
-        self.governor_epp.store(epp, Ordering::Relaxed);
+        self.governor_is_capped.store(is_capped, Ordering::Relaxed);
+        self.governor_cap_mhz.store(cap_mhz, Ordering::Relaxed);
+        self.governor_epp.store(if is_capped { 65 } else { 25 }, Ordering::Relaxed);
     }
 
     pub fn is_governor_enabled(&self) -> bool {
         self.governor_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn is_governor_capped(&self) -> bool {
+        self.governor_is_capped.load(Ordering::Relaxed)
     }
 
     pub fn toggle_governor(&self) -> bool {
@@ -200,11 +210,12 @@ impl TrayState {
         !prev
     }
 
-    pub fn get_governor_info(&self) -> (bool, u32, u32) {
+    pub fn get_governor_info(&self) -> (bool, u32, bool, u32) {
         (
             self.governor_enabled.load(Ordering::Relaxed),
             self.governor_target_temp.load(Ordering::Relaxed),
-            self.governor_epp.load(Ordering::Relaxed),
+            self.governor_is_capped.load(Ordering::Relaxed),
+            self.governor_cap_mhz.load(Ordering::Relaxed),
         )
     }
 
@@ -327,19 +338,23 @@ impl TrayHandle {
         );
     }
 
-    pub fn update_governor_status(&self, enabled: bool, target_temp: u32, epp: u32) {
-        self.state.update_governor_status(enabled, target_temp, epp);
+    pub fn update_governor_status(&self, enabled: bool, target_temp: u32, is_capped: bool, cap_mhz: u32) {
+        self.state.update_governor_status(enabled, target_temp, is_capped, cap_mhz);
     }
 
     pub fn is_governor_enabled(&self) -> bool {
         self.state.is_governor_enabled()
     }
 
+    pub fn is_governor_capped(&self) -> bool {
+        self.state.is_governor_capped()
+    }
+
     pub fn toggle_governor(&self) -> bool {
         self.state.toggle_governor()
     }
 
-    pub fn get_governor_info(&self) -> (bool, u32, u32) {
+    pub fn get_governor_info(&self) -> (bool, u32, bool, u32) {
         self.state.get_governor_info()
     }
 
@@ -769,21 +784,26 @@ unsafe fn show_tray_menu(
 
     let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
 
-    // 3. Khóa nhiệt độ CPU mục tiêu (Smooth EPP Thermal Governor)
-    let (gov_enabled, gov_target, gov_epp) = state.get_governor_info();
+    // 3. Khóa nhiệt độ CPU mục tiêu (2-Phase Hysteresis Thermal Clamping)
+    let (gov_enabled, gov_target, is_capped, cap_mhz) = state.get_governor_info();
     let gov_check = if gov_enabled {
         MF_CHECKED
     } else {
         MF_UNCHECKED
     };
     let gov_text = if gov_enabled {
-        if gov_epp == 0 {
-            format!("Khóa nhiệt độ CPU ({}°C - Smooth EPP) [BẬT - Boost]\0", gov_target)
+        if is_capped {
+            let cap_str = if cap_mhz > 0 {
+                format!("{:.1} GHz", cap_mhz as f32 / 1000.0)
+            } else {
+                "3.8 GHz".to_string()
+            };
+            format!("Khóa nhiệt độ CPU ({}°C) [HÃM NHIỆT - {}]\0", gov_target, cap_str)
         } else {
-            format!("Khóa nhiệt độ CPU ({}°C - Smooth EPP) [BẬT - EPP: {}]\0", gov_target, gov_epp)
+            format!("Khóa nhiệt độ CPU ({}°C) [BẬT - Unlocked 4.90 GHz]\0", gov_target)
         }
     } else {
-        format!("Khóa nhiệt độ CPU ({}°C - Smooth EPP) [TẮT]\0", gov_target)
+        format!("Khóa nhiệt độ CPU ({}°C) [TẮT]\0", gov_target)
     };
     let wide_gov: Vec<u16> = gov_text.encode_utf16().collect();
     let _ = AppendMenuW(
@@ -999,15 +1019,17 @@ mod tests {
 
         // Kiểm tra Thermal Governor State
         assert!(state.is_governor_enabled());
-        assert_eq!(state.get_governor_info(), (true, 80, 0));
+        assert!(!state.is_governor_capped());
+        assert_eq!(state.get_governor_info(), (true, 80, false, 0));
 
-        state.update_governor_status(true, 85, 25);
-        assert_eq!(state.get_governor_info(), (true, 85, 25));
+        state.update_governor_status(true, 85, true, 3800);
+        assert_eq!(state.get_governor_info(), (true, 85, true, 3800));
+        assert!(state.is_governor_capped());
 
         let toggled = state.toggle_governor();
         assert!(!toggled);
         assert!(!state.is_governor_enabled());
-        assert_eq!(state.get_governor_info(), (false, 85, 25));
+        assert_eq!(state.get_governor_info(), (false, 85, true, 3800));
 
         // Kiểm tra Metrics (Power & Clock)
         assert_eq!(state.get_metrics(), (0, 0, 0, 0));
