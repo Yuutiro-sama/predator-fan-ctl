@@ -858,6 +858,14 @@ impl SystemTelemetryReader {
         )
     }
 
+    /// Đọc nhanh nhiệt độ CPU tức thời (°C) qua WMI ACPI ThermalZone.
+    /// Thực hiện trực tiếp qua kết nối WMI chuyên biệt, 0 memory allocation trong chu kỳ lặp.
+    /// Phục vụ chu kỳ Fast Tick (200ms) của luồng Governor để phản ứng tức thời trước các xung nhiệt 100ms.
+    #[inline]
+    pub fn read_cpu_temp(&self) -> Option<u32> {
+        self.cpu_temp.read_temp()
+    }
+
     #[inline]
     pub fn last_system_temp(&self) -> u32 {
         if let Some((t, recorded_at)) = self.last_system_temp {
@@ -1059,5 +1067,15 @@ mod tests {
         let (_, _, sys_t_expired, _, _, _, _) = reader.poll(Some(&mut mock));
         assert_eq!(sys_t_expired, 0);
         assert_eq!(reader.last_system_temp(), 0);
+    }
+
+    #[test]
+    fn test_system_telemetry_reader_fast_read_cpu_temp() {
+        let reader = SystemTelemetryReader::new();
+        let cpu_t = reader.read_cpu_temp();
+        println!("Fast read CPU temp via read_cpu_temp(): {:?}", cpu_t);
+        if let Some(t) = cpu_t {
+            assert!(t >= 20 && t <= 115, "Fast read CPU temp {} out of realistic range", t);
+        }
     }
 }

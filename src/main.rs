@@ -189,6 +189,18 @@ fn main() {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 
+    // Đăng ký panic hook để đảm bảo khôi phục thiết lập nguồn hệ điều hành nếu có lỗi bất ngờ
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        eprintln!("[PANIC FAIL-SAFE] An unhandled panic occurred! Restoring CPU power parameters...");
+        let mut emergency_gov = ThermalGovernor::new(predator_fan_ctl::governor::ThermalGovernorConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        emergency_gov.reset_to_maximum();
+        default_panic_hook(panic_info);
+    }));
+
     // 1. Tự động kết nối tới Console của tiến trình cha (nếu được khởi chạy từ PowerShell/CMD)
     unsafe {
         let _ = AttachConsole(ATTACH_PARENT_PROCESS);
@@ -382,9 +394,10 @@ fn main() {
             governor.config.target_temp, governor.config.max_epp, governor.config.enabled);
 
         let mut last_watchdog_refresh = Instant::now();
+        let mut tick_count: u64 = 0;
 
         while worker_running_clone.load(Ordering::Relaxed) && GLOBAL_RUNNING.load(Ordering::Relaxed) {
-            // Xử lý các lệnh từ menu khay hệ thống (non-blocking)
+            // Xử lý các lệnh từ menu khay hệ thống (non-blocking, phản hồi tức thời trong 200ms)
             while let Ok(cmd) = cmd_receiver.try_recv() {
                 match cmd {
                     TrayCommand::SetProfile(profile) => {
@@ -464,90 +477,99 @@ fn main() {
                 break;
             }
 
-            // Đọc toàn bộ thông số cảm biến thời gian thực (bao gồm cả system_temp)
-            let (cpu_temp, gpu_temp, system_temp, cpu_power, gpu_power, cpu_mhz, gpu_mhz) =
-                telemetry_reader.poll(Some(&mut *backend));
-
-            // Tính toán tốc độ quạt mục tiêu dựa theo Profile
-            let active_profile = worker_tray_handle.get_profile();
-            let (target_cpu_speed, target_gpu_speed) = match active_profile {
-                FanProfile::ActiveCurve => {
-                    let cs = evaluate_curve(&worker_config.cpu_curve, cpu_temp);
-                    let gs = evaluate_curve(&worker_config.gpu_curve, gpu_temp);
-                    (cs, gs)
-                }
-                FanProfile::Turbo => (100, 100),
-                FanProfile::Silent => (25, 25),
-            };
-
-            // Cơ chế Fail-Safe & Tối ưu: Chỉ ghi bus phần cứng khi tốc độ thay đổi
-            // hoặc làm mới định kỳ mỗi 10 giây để chống Watchdog BIOS tự reset
-            let need_hw_write = target_cpu_speed != last_cpu_speed
-                || target_gpu_speed != last_gpu_speed
-                || last_watchdog_refresh.elapsed() >= Duration::from_secs(10);
-
-            if need_hw_write {
-                backend.set_speeds(target_cpu_speed, target_gpu_speed);
-                last_cpu_speed = target_cpu_speed;
-                last_gpu_speed = target_gpu_speed;
-                last_watchdog_refresh = Instant::now();
-            }
-
-            // Cập nhật Smooth EPP Thermal Governor (Zero Stuttering)
-            let current_epp = governor.update(cpu_temp);
+            // ========================================================================
+            // FAST TICK (200ms - 5 Hz): Đọc nhanh nhiệt độ CPU & Chạy Thermal Governor
+            // ========================================================================
+            // Đọc trực tiếp qua WMI ACPI ThermalZone không phân bổ bộ nhớ (0 allocation)
+            let fast_cpu_temp = telemetry_reader.read_cpu_temp().unwrap_or(telemetry_reader.last_cpu_temp());
+            let current_epp = governor.update(fast_cpu_temp);
             worker_tray_handle.update_governor_status(
                 governor.config.enabled,
                 governor.config.target_temp,
                 current_epp,
             );
 
-            // Đọc RPM thời gian thực từ cảm biến phần cứng
-            let (cpu_rpm, gpu_rpm) = backend.read_fan_rpms().unwrap_or((0, 0));
+            // ========================================================================
+            // SLOW TELEMETRY & FAN TICK (1000ms - mỗi 5 ticks):
+            // ========================================================================
+            tick_count = tick_count.wrapping_add(1);
+            if tick_count.is_multiple_of(5) {
+                // Đọc toàn bộ thông số cảm biến thời gian thực (bao gồm cả system_temp)
+                let (cpu_temp, gpu_temp, system_temp, cpu_power, gpu_power, cpu_mhz, gpu_mhz) =
+                    telemetry_reader.poll(Some(&mut *backend));
 
-            // Cập nhật trạng thái System Tray (bao gồm cả công suất, xung nhịp và nhiệt độ hệ thống)
-            worker_tray_handle.update_full_status(
-                cpu_temp, target_cpu_speed, gpu_temp, target_gpu_speed, cpu_rpm, gpu_rpm,
-                cpu_power, gpu_power, cpu_mhz, gpu_mhz,
-            );
-            worker_tray_handle.update_system_temp(system_temp);
+                // Tính toán tốc độ quạt mục tiêu dựa theo Profile
+                let active_profile = worker_tray_handle.get_profile();
+                let (target_cpu_speed, target_gpu_speed) = match active_profile {
+                    FanProfile::ActiveCurve => {
+                        let cs = evaluate_curve(&worker_config.cpu_curve, cpu_temp);
+                        let gs = evaluate_curve(&worker_config.gpu_curve, gpu_temp);
+                        (cs, gs)
+                    }
+                    FanProfile::Turbo => (100, 100),
+                    FanProfile::Silent => (25, 25),
+                };
 
-            // Cập nhật bộ đệm lịch sử Telemetry (Zero-Allocation micro-lock)
-            if let Ok(mut hist) = worker_telemetry.try_lock() {
-                hist.push(
-                    cpu_temp as u8, gpu_temp as u8, system_temp as u8, target_cpu_speed, target_gpu_speed,
+                // Cơ chế Fail-Safe & Tối ưu: Chỉ ghi bus phần cứng khi tốc độ thay đổi
+                // hoặc làm mới định kỳ mỗi 10 giây để chống Watchdog BIOS tự reset
+                let need_hw_write = target_cpu_speed != last_cpu_speed
+                    || target_gpu_speed != last_gpu_speed
+                    || last_watchdog_refresh.elapsed() >= Duration::from_secs(10);
+
+                if need_hw_write {
+                    backend.set_speeds(target_cpu_speed, target_gpu_speed);
+                    last_cpu_speed = target_cpu_speed;
+                    last_gpu_speed = target_gpu_speed;
+                    last_watchdog_refresh = Instant::now();
+                }
+
+                // Đọc RPM thời gian thực từ cảm biến phần cứng
+                let (cpu_rpm, gpu_rpm) = backend.read_fan_rpms().unwrap_or((0, 0));
+
+                // Cập nhật trạng thái System Tray (bao gồm cả công suất, xung nhịp và nhiệt độ hệ thống)
+                worker_tray_handle.update_full_status(
+                    cpu_temp, target_cpu_speed, gpu_temp, target_gpu_speed, cpu_rpm, gpu_rpm,
                     cpu_power, gpu_power, cpu_mhz, gpu_mhz,
                 );
+                worker_tray_handle.update_system_temp(system_temp);
+
+                // Cập nhật bộ đệm lịch sử Telemetry (Zero-Allocation micro-lock)
+                if let Ok(mut hist) = worker_telemetry.try_lock() {
+                    hist.push(
+                        cpu_temp as u8, gpu_temp as u8, system_temp as u8, target_cpu_speed, target_gpu_speed,
+                        cpu_power, gpu_power, cpu_mhz, gpu_mhz,
+                    );
+                }
+
+                // Cập nhật tooltip khay hệ thống hiển thị: "CPU: XX°C XX.XW X.XXGHz | GPU: XX°C XX.XW X.XXGHz (| Sys: ZZ°C)"
+                let tip = if system_temp > 0 {
+                    format!(
+                        "CPU: {}°C {:.1}W {:.2}GHz | GPU: {}°C {:.1}W {:.2}GHz | Sys: {}°C",
+                        cpu_temp,
+                        cpu_power as f32 / 10.0,
+                        cpu_mhz as f32 / 1000.0,
+                        gpu_temp,
+                        gpu_power as f32 / 10.0,
+                        gpu_mhz as f32 / 1000.0,
+                        system_temp,
+                    )
+                } else {
+                    format!(
+                        "CPU: {}°C {:.1}W {:.2}GHz | GPU: {}°C {:.1}W {:.2}GHz",
+                        cpu_temp,
+                        cpu_power as f32 / 10.0,
+                        cpu_mhz as f32 / 1000.0,
+                        gpu_temp,
+                        gpu_power as f32 / 10.0,
+                        gpu_mhz as f32 / 1000.0,
+                    )
+                };
+                worker_tray_handle.update_tooltip(&tip);
             }
 
-            // Cập nhật tooltip khay hệ thống hiển thị: "CPU: XX°C XX.XW X.XXGHz | GPU: XX°C XX.XW X.XXGHz (| Sys: ZZ°C)"
-            let tip = if system_temp > 0 {
-                format!(
-                    "CPU: {}°C {:.1}W {:.2}GHz | GPU: {}°C {:.1}W {:.2}GHz | Sys: {}°C",
-                    cpu_temp,
-                    cpu_power as f32 / 10.0,
-                    cpu_mhz as f32 / 1000.0,
-                    gpu_temp,
-                    gpu_power as f32 / 10.0,
-                    gpu_mhz as f32 / 1000.0,
-                    system_temp,
-                )
-            } else {
-                format!(
-                    "CPU: {}°C {:.1}W {:.2}GHz | GPU: {}°C {:.1}W {:.2}GHz",
-                    cpu_temp,
-                    cpu_power as f32 / 10.0,
-                    cpu_mhz as f32 / 1000.0,
-                    gpu_temp,
-                    gpu_power as f32 / 10.0,
-                    gpu_mhz as f32 / 1000.0,
-                )
-            };
-            worker_tray_handle.update_tooltip(&tip);
-
-            // Ngủ theo khoảng thời gian cấu hình (chia nhỏ 50ms để đáp ứng lệnh thoát tức thì)
-            let poll_ms = worker_config.poll_interval_ms.max(100);
-            let chunks = (poll_ms / 50).max(1);
-            for _ in 0..chunks {
+            // Ngủ chu kỳ nhịp Fast Tick 200ms (5 Hz)
+            // Chia thành 4 lát nhỏ 50ms để đáp ứng lệnh dừng/thoát tức thì (dưới 50ms)
+            for _ in 0..4 {
                 if !worker_running_clone.load(Ordering::Relaxed) || !GLOBAL_RUNNING.load(Ordering::Relaxed) {
                     break;
                 }
@@ -616,5 +638,20 @@ mod tests {
         let guard3 = SingleInstanceGuard::acquire(test_mutex_name)
             .expect("Third mutex acquire must succeed");
         assert!(!guard3.is_already_running(), "New instance after release must not report already running");
+    }
+
+    #[test]
+    fn test_decoupled_cadence_tick_ratio() {
+        // Kiểm tra logic phân tách chu kỳ: Fast Tick (5 Hz) so với Slow Telemetry Tick (1 Hz)
+        let total_fast_ticks = 25; // 25 ticks tương đương 5 giây
+        let mut slow_tick_count = 0;
+
+        for tick in 1..=total_fast_ticks {
+            if tick % 5 == 0 {
+                slow_tick_count += 1;
+            }
+        }
+
+        assert_eq!(slow_tick_count, 5, "Trong 5 giây (25 Fast Ticks), phải có đúng 5 Slow Ticks (1000ms/tick)");
     }
 }

@@ -1,9 +1,10 @@
 //! Module Vi điều khiển Năng lượng & Nhiệt độ Động (Closed-Loop Thermal Governor).
 //!
 //! Quản lý và điều phối mượt mà trạng thái năng lượng vi xử lý thông qua
-//! Intel Speed Shift Energy Performance Preference (`PERFEPP`), giúp duy trì nhiệt độ
-//! mục tiêu một cách êm ái, loại bỏ hoàn toàn hiện tượng khựng khung hình (Zero Stuttering),
-//! đồng thời TUYỆT ĐỐI KHÔNG BAO GIỜ tắt Intel Turbo Boost (PROCTHROTTLEMAX luôn giữ 100%).
+//! Intel Speed Shift Energy Performance Preference (`PERFEPP`) kết hợp cơ chế
+//! **Emergency Turbo Cut via PROCTHROTTLEMAX** có tính trễ nhiệt (Hysteresis),
+//! giúp dập tắt triệt để hiện tượng xung công suất đột ngột lên 124.6W và đỉnh nhiệt 96°C
+//! trên vi xử lý Intel Core i7-13650HX (Raptor Lake-HX), đưa nhiệt độ về ổn định quanh mốc mục tiêu.
 
 use serde::{Deserialize, Serialize};
 use windows::core::GUID;
@@ -24,7 +25,9 @@ pub const GUID_PROCESSOR_SETTINGS_SUBGROUP: GUID = GUID {
 
 /// GUID thiết lập phần trăm xung nhịp CPU tối đa (Maximum Processor State / PROCTHROTTLEMAX)
 /// Value: bc5038f7-23e0-4960-96da-33abaf5935ec
-/// Lưu ý: Luôn luôn được ghim ở mức 100% để Windows không tắt Intel Turbo Boost!
+/// - 100%: Cho phép vi xử lý bung xung Turbo Boost tối đa (lên tới 4.9 GHz).
+/// -  99%: Ngắt khẩn cấp Turbo Boost trên Windows, khóa CPU tại xung cơ bản (Base Clock 2.6 GHz),
+///         hạ tức thì công suất gói từ 124.6W về ~25W - 35W để dập tắt spike nhiệt.
 pub const GUID_PROCESSOR_THROTTLE_MAXIMUM: GUID = GUID {
     data1: 0xbc5038f7,
     data2: 0x23e0,
@@ -35,10 +38,11 @@ pub const GUID_PROCESSOR_THROTTLE_MAXIMUM: GUID = GUID {
 /// GUID thiết lập thiên hướng hiệu năng / năng lượng (Energy Performance Preference / PERFEPP)
 /// Value: 36687f9e-e3a5-4dbf-b1dc-15eb381c6863
 /// Dải giá trị:
-///   0: Maximum Performance (Intel Speed Shift duy trì 4.5 - 4.9 GHz Boost liên tục)
-///  25: High Performance Smooth (~4.0 - 4.5 GHz)
-///  35: Balanced Gaming (~3.8 - 4.2 GHz)
-///  50: Balanced (~3.4 - 3.8 GHz)
+///   0: Maximum Performance (Speed Shift duy trì xung nhịp cao nhất có thể)
+///  30: High Performance Smooth (~4.0 - 4.5 GHz, mát mẻ khi cách xa mục tiêu)
+///  50: Windows Balanced mặc định (~3.4 - 3.8 GHz)
+///  75: Throttled Smooth (tiệm cận ngưỡng an toàn target - 4°C)
+///  90: Maximum Throttle Bias kết hợp cùng ngắt Turbo
 pub const GUID_PROCESSOR_PERF_ENERGY_PERFORMANCE_PREFERENCE: GUID = GUID {
     data1: 0x36687f9e,
     data2: 0xe3a5,
@@ -69,11 +73,11 @@ pub struct ThermalGovernorConfig {
     #[serde(default = "default_governor_enabled")]
     pub enabled: bool,
 
-    /// Nhiệt độ mục tiêu (°C) - mặc định 80°C
+    /// Nhiệt độ mục tiêu (°C) - mặc định 80°C (hoặc 75°C khi siết chặt)
     #[serde(default = "default_target_temp", alias = "target_cpu_temp")]
     pub target_temp: u32,
 
-    /// Dải dung sai ổn định nhiệt độ (±°C) - mặc định 0°C để lấy target_temp làm trần cứng kiểm soát
+    /// Dải dung sai ổn định nhiệt độ (±°C)
     #[serde(default = "default_tolerance")]
     pub tolerance: u32,
 
@@ -115,22 +119,29 @@ impl From<&crate::config::ThermalGovernorConfig> for ThermalGovernorConfig {
     }
 }
 
-/// Bộ điều khiển nhiệt độ CPU động vòng kín qua Intel Speed Shift EPP (Smooth EPP Thermal Governor).
-/// Tương tác trực tiếp với Win32 Power Management subsystem để ghim nhiệt độ mục tiêu một cách êm ái
-/// thông qua thuật toán Asymmetric Proportional-Derivative (Fast Attack / Slow Decay),
-/// đồng thời TUYỆT ĐỐI KHÔNG BAO GIỜ tắt Intel Turbo Boost (PROCTHROTTLEMAX luôn giữ 100%).
+/// Bộ điều khiển nhiệt độ CPU động vòng kín kết hợp Emergency Turbo Cut (PROCTHROTTLEMAX 99%)
+/// và Intel Speed Shift EPP tuyến tính (Smooth EPP Thermal Governor).
 pub struct ThermalGovernor {
     /// Cấu hình hoạt động
     pub config: ThermalGovernorConfig,
 
-    /// Mức EPP hiện tại đang áp dụng (0 = Maximum Boost, 90 = Throttle)
+    /// Mức Throttle tối đa hiện tại (100 = Turbo Boost bật, 99 = Turbo Cut)
+    pub current_throttle_max: u32,
+
+    /// Mức EPP hiện tại đang áp dụng (0..90)
     pub current_epp: u32,
 
     /// Nhiệt độ CPU chu kỳ trước để theo dõi tốc độ tăng nhiệt (dT/dt)
     pub prev_cpu_temp: Option<u32>,
 
-    /// Mức EPP gốc đọc từ hệ điều hành lúc khởi động để khôi phục
+    /// Mức EPP gốc đọc từ hệ điều hành lúc khởi động để khôi phục (hoặc 50)
     pub original_epp: u32,
+
+    /// Mức Throttle tối đa cuối cùng đã ghi thành công vào Windows Power Subsystem
+    pub last_applied_throttle_max: u32,
+
+    /// Mức EPP cuối cùng đã ghi thành công vào Windows Power Subsystem
+    pub last_applied_epp: u32,
 
     /// GUID của Power Scheme đang hoạt động trên Windows
     pub active_scheme_guid: Option<GUID>,
@@ -146,24 +157,41 @@ impl ThermalGovernor {
     pub fn new(config: ThermalGovernorConfig) -> Self {
         let (active_scheme_guid, original_epp) = Self::init_power_scheme();
 
-        let governor = Self {
+        let mut governor = Self {
             config,
+            current_throttle_max: 100,
             current_epp: 0,
             prev_cpu_temp: None,
             original_epp,
+            last_applied_throttle_max: u32::MAX,
+            last_applied_epp: u32::MAX,
             active_scheme_guid,
             apply_to_hardware: true,
         };
 
-        governor.apply_epp(0);
+        // Ghi áp dụng trạng thái ban đầu (100% Throttle, EPP = 0)
+        governor.apply_power_settings(100, 0);
         governor
     }
 
     /// Khởi tạo phiên bản kiểm thử không can thiệp trực tiếp vào thiết lập nguồn của hệ điều hành.
     pub fn new_test(config: ThermalGovernorConfig) -> Self {
-        let mut governor = Self::new(config);
-        governor.apply_to_hardware = false;
-        governor
+        Self {
+            config,
+            current_throttle_max: 100,
+            current_epp: 0,
+            prev_cpu_temp: None,
+            original_epp: 50,
+            last_applied_throttle_max: 100,
+            last_applied_epp: 0,
+            active_scheme_guid: None,
+            apply_to_hardware: false,
+        }
+    }
+
+    /// Kiểm tra xem cơ chế Emergency Turbo Cut có đang được kích hoạt hay không.
+    pub fn is_turbo_cut(&self) -> bool {
+        self.current_throttle_max < 100
     }
 
     /// Hàm nội bộ đọc Active Power Scheme GUID, ghi đè PROCTHROTTLEMAX = 100% và đọc EPP gốc từ Windows
@@ -172,7 +200,7 @@ impl ThermalGovernor {
             let mut p_guid: *mut GUID = std::ptr::null_mut();
             let res = PowerGetActiveScheme(None, &mut p_guid);
             if res.0 != 0 || p_guid.is_null() {
-                return (None, 0);
+                return (None, 50);
             }
 
             let scheme = *p_guid;
@@ -187,9 +215,9 @@ impl ThermalGovernor {
                 Some(&GUID_PROCESSOR_PERF_ENERGY_PERFORMANCE_PREFERENCE),
                 &mut orig_val,
             );
-            let orig = if read_res.0 == 0 { orig_val } else { 0 };
+            let orig = if read_res.0 == 0 && orig_val > 0 { orig_val } else { 50 };
 
-            // TUYỆT ĐỐI KHÔNG HẠ PROCTHROTTLEMAX: Luôn ghim PROCTHROTTLEMAX = 100% để giữ Turbo Boost
+            // Khởi tạo đảm bảo PROCTHROTTLEMAX = 100% để giữ Turbo Boost
             let _ = PowerWriteACValueIndex(
                 None,
                 &scheme,
@@ -210,21 +238,89 @@ impl ThermalGovernor {
         }
     }
 
-    /// Thuật toán thuần túy tính toán mức EPP kế tiếp dựa trên sai số nhiệt độ và đạo hàm tốc độ tăng nhiệt (Pure Function).
+    /// Tính toán mức EPP tuyến tính trong dải an toàn (Safe Zone):
+    /// - Khi cách xa mục tiêu (dist = target - t_now >= 12°C): EPP = 30
+    /// - Khi tiệm cận ngưỡng an toàn (dist = 4°C, tức target - 4°C): EPP = 75
+    /// - Khi 4 < dist < 12: nội suy tuyến tính từ 30 lên 75
+    /// - Khi dist < 4 (trong trường hợp chưa kích hoạt Turbo Cut): nâng dần từ 75 lên 85
+    pub fn calculate_linear_epp(t_now: i32, target: i32, max_epp: u32) -> u32 {
+        let dist = target - t_now;
+        let epp = if dist >= 12 {
+            30
+        } else if dist <= 4 {
+            if dist <= 1 {
+                85
+            } else {
+                // dist = 4 -> 75, dist = 3 -> 78, dist = 2 -> 82
+                75 + (4 - dist) as u32 * 3
+            }
+        } else {
+            // 4 < dist < 12: nội suy tuyến tính từ 30 lên 75
+            // dist = 12 -> 30, dist = 4 -> 75 (chênh lệch 45 trên 8 độ)
+            let ratio = (12 - dist) as f32 / 8.0;
+            (30.0 + ratio * 45.0).round() as u32
+        };
+
+        epp.clamp(0, max_epp)
+    }
+
+    /// Thuật toán thuần túy tính toán trạng thái điều phối kế tiếp `(PROCTHROTTLEMAX, PERFEPP)`.
     ///
-    /// Áp dụng mô hình Asymmetric Proportional-Derivative (Fast Attack / Slow Decay):
-    /// - `diff = (current_temp as i32) - (target_temp as i32)`
-    /// - `rate = match prev_temp { Some(p) => current_temp as i32 - p as i32, None => 0 }`
-    ///
-    /// Bảng nhảy bậc bất đối xứng:
-    /// - `diff >= 3` (quá nhiệt >= +3°C, vd >= 78°C khi target 75°C): Emergency Clamp -> `current_epp.max(85).min(max_epp)`
-    /// - `diff == 2` (quá nhiệt +2°C, vd 77°C): Hard Throttle -> `(current_epp.saturating_add(25)).max(65).min(max_epp)`
-    /// - `diff == 1` (quá nhiệt +1°C, vd 76°C): Proportional Attack -> `(current_epp.saturating_add(15)).max(45).min(max_epp)`
-    /// - `diff == 0` (đang ở đúng 75°C):
-    ///   + Nếu `rate > 0` (nhiệt độ đang trên đà tăng spike): Pre-emptive Hold -> `(current_epp.saturating_add(8)).min(max_epp)`
-    ///   + Nếu `rate <= 0`: Giữ nguyên `current_epp`
-    /// - `diff == -1` (vd 74°C): Giữ nguyên `current_epp` (vùng đệm chống rung xung nhịp)
-    /// - `diff <= -2` (vd <= 73°C): Smooth Recovery -> `current_epp.saturating_sub(3)` (hoặc -5 nếu `diff <= -4`), sàn là 0.
+    /// Cơ chế phối hợp 2 tầng:
+    /// 1. Emergency Turbo Cut via PROCTHROTTLEMAX:
+    ///    - Kích hoạt khi: `T_now >= target_temp - 1` HOẶC nhiệt độ dự báo `T_pred >= target_temp + 1`
+    ///      với `T_pred = T_now + 2 * (T_now - T_prev)` (dự báo trước 400ms ở chu kỳ 200ms).
+    ///    - Khi kích hoạt: Đặt `PROCTHROTTLEMAX = 99` (ngắt Turbo Boost) và `PERFEPP = 90`.
+    ///    - Duy trì ngắt Turbo (Hysteresis): Giữ nguyên `(99, 90)` cho tới khi nhiệt độ hạ an toàn
+    ///      `T_now <= target_temp - 4`.
+    /// 2. Active Linear Modulation khi đã an toàn:
+    ///    - Khôi phục `PROCTHROTTLEMAX = 100` (mở lại Turbo Boost).
+    ///    - Điều biến `PERFEPP` tuyến tính từ 30 đến 75 tuỳ theo khoảng cách tới `target_temp`.
+    pub fn calculate_next_state(
+        current_throttle_max: u32,
+        _current_epp: u32,
+        current_cpu_temp: u32,
+        prev_cpu_temp: Option<u32>,
+        target_temp: u32,
+        max_epp: u32,
+    ) -> (u32, u32) {
+        let t_now = current_cpu_temp as i32;
+        let t_prev = prev_cpu_temp.map(|p| p as i32).unwrap_or(t_now);
+        let delta = t_now - t_prev;
+        let t_pred = t_now + 2 * delta;
+        let target = target_temp as i32;
+
+        let is_currently_cut = current_throttle_max < 100;
+
+        // Điều kiện kích hoạt ngắt khẩn cấp Turbo Boost:
+        // 1. Nhiệt độ hiện tại đã chạm hoặc vượt ngưỡng cảnh báo (target - 1)
+        // 2. Tốc độ tăng nhiệt đột ngột dẫn tới dự báo vượt trần (T_pred > target, tức T_pred >= target + 1)
+        let trigger_turbo_cut = t_now >= target - 1 || t_pred > target;
+
+        if is_currently_cut {
+            // Đang ở trạng thái Emergency Turbo Cut: Áp dụng Hysteresis 4°C
+            // Chỉ mở lại Turbo khi T_now <= target - 4 và không có đà tăng nhiệt spike mới
+            if t_now <= target - 4 && !trigger_turbo_cut {
+                let next_epp = Self::calculate_linear_epp(t_now, target, max_epp);
+                (100, next_epp)
+            } else {
+                // Tiếp tục duy trì ngắt Turbo để làm mát an toàn
+                (99, 90.min(max_epp))
+            }
+        } else {
+            // Đang ở trạng thái bình thường (PROCTHROTTLEMAX == 100)
+            if trigger_turbo_cut {
+                // Ngắt khẩn cấp Turbo Boost tức thì
+                (99, 90.min(max_epp))
+            } else {
+                // Điều biến mượt EPP tuyến tính
+                let next_epp = Self::calculate_linear_epp(t_now, target, max_epp);
+                (100, next_epp)
+            }
+        }
+    }
+
+    /// Tương thích ngược: Tính toán mức EPP kế tiếp khi giữ PROCTHROTTLEMAX = 100.
     pub fn calculate_next_epp(
         current_epp: u32,
         current_cpu_temp: u32,
@@ -232,55 +328,31 @@ impl ThermalGovernor {
         target_temp: u32,
         max_epp: u32,
     ) -> u32 {
-        let diff = (current_cpu_temp as i32) - (target_temp as i32);
-        let rate = match prev_cpu_temp {
-            Some(p) => (current_cpu_temp as i32) - (p as i32),
-            None => 0,
-        };
-
-        let next = if diff >= 3 {
-            // Emergency Clamp: Quá nhiệt >= +3°C, nhảy tức thì lên 85-90 để cắt đỉnh nhiệt ngay lập tức
-            current_epp.max(85).min(max_epp)
-        } else if diff == 2 {
-            // Hard Throttle: Quá nhiệt +2°C, hãm mạnh xung nhịp
-            current_epp.saturating_add(25).max(65).min(max_epp)
-        } else if diff == 1 {
-            // Proportional Attack: Quá nhiệt +1°C, chặn đà tăng nhiệt ngay khi chớm vượt
-            current_epp.saturating_add(15).max(45).min(max_epp)
-        } else if diff == 0 {
-            if rate > 0 {
-                // Pre-emptive Hold: Spike dốc khi chạm mốc target (dT/dt > 0), hãm đón đầu
-                current_epp.saturating_add(8).min(max_epp)
-            } else {
-                // Đứng yên hoặc giảm nhiệt: Giữ nguyên EPP
-                current_epp
-            }
-        } else if diff == -1 {
-            // Vùng đệm chống săn xung (Anti-Hunting deadband buffer)
-            current_epp
-        } else if diff <= -4 {
-            // Rất mát (<= target - 4): Giảm nhanh EPP -5 về sàn 0
-            current_epp.saturating_sub(5)
-        } else {
-            // Mát vừa (diff == -2 hoặc -3): Smooth Recovery giảm nhẹ EPP -3
-            current_epp.saturating_sub(3)
-        };
-
-        next.clamp(0, max_epp)
+        Self::calculate_next_state(
+            100,
+            current_epp,
+            current_cpu_temp,
+            prev_cpu_temp,
+            target_temp,
+            max_epp,
+        ).1
     }
 
     /// Cập nhật vòng lặp điều khiển nhiệt độ với giá trị nhiệt độ CPU hiện tại (°C).
+    /// Tự động áp dụng tối ưu hóa Win32 Power API (chỉ ghi khi thông số thay đổi).
     /// Trả về mức EPP (0 - max_epp) sau khi tính toán và áp dụng.
     pub fn update(&mut self, current_cpu_temp: u32) -> u32 {
         if !self.config.enabled {
-            if self.current_epp != 0 {
+            let safe_epp = if self.original_epp > 0 { self.original_epp } else { 50 };
+            if self.current_epp != safe_epp || self.current_throttle_max != 100 {
                 self.reset_to_maximum();
             }
             self.prev_cpu_temp = None;
             return self.current_epp;
         }
 
-        let next_epp = Self::calculate_next_epp(
+        let (next_throttle_max, next_epp) = Self::calculate_next_state(
+            self.current_throttle_max,
             self.current_epp,
             current_cpu_temp,
             self.prev_cpu_temp,
@@ -288,87 +360,123 @@ impl ThermalGovernor {
             self.config.max_epp,
         );
 
-        if next_epp != self.current_epp {
+        if next_throttle_max != self.current_throttle_max || next_epp != self.current_epp {
+            self.current_throttle_max = next_throttle_max;
             self.current_epp = next_epp;
-            self.apply_epp(self.current_epp);
+            self.apply_power_settings(self.current_throttle_max, self.current_epp);
         }
 
         self.prev_cpu_temp = Some(current_cpu_temp);
         self.current_epp
     }
 
-    /// Áp dụng giá trị EPP và đảm bảo PROCTHROTTLEMAX = 100% vào Windows Power Scheme qua `powrprof.dll`.
-    pub fn apply_epp(&self, epp_val: u32) -> bool {
+    /// Áp dụng đồng thời PROCTHROTTLEMAX và PERFEPP vào Windows Power Scheme qua `powrprof.dll`.
+    ///
+    /// Tối ưu hóa Win32 Power API:
+    /// - Kiểm tra bộ nhớ cache `last_applied_throttle_max` và `last_applied_epp`.
+    /// - Chỉ gọi `PowerWriteACValueIndex` / `PowerWriteDCValueIndex` cho tham số thực sự thay đổi.
+    /// - Chỉ gọi `PowerSetActiveScheme` khi có ít nhất một giá trị thay đổi, tránh lãng phí chu kỳ CPU mỗi 200ms.
+    pub fn apply_power_settings(&mut self, throttle_max: u32, epp_val: u32) -> bool {
         if !self.apply_to_hardware {
+            self.last_applied_throttle_max = throttle_max;
+            self.last_applied_epp = epp_val;
+            return true;
+        }
+
+        if self.last_applied_throttle_max == throttle_max && self.last_applied_epp == epp_val {
             return true;
         }
 
         if let Some(ref scheme) = self.active_scheme_guid {
             unsafe {
-                // 1. Luôn ghim PROCTHROTTLEMAX = 100% cho cả AC và DC để đảm bảo không bao giờ tắt Intel Turbo Boost
-                let write_max_ac = PowerWriteACValueIndex(
-                    None,
-                    scheme,
-                    Some(&GUID_PROCESSOR_SETTINGS_SUBGROUP),
-                    Some(&GUID_PROCESSOR_THROTTLE_MAXIMUM),
-                    100,
-                );
-                let write_max_dc = PowerWriteDCValueIndex(
-                    None,
-                    scheme,
-                    Some(&GUID_PROCESSOR_SETTINGS_SUBGROUP),
-                    Some(&GUID_PROCESSOR_THROTTLE_MAXIMUM),
-                    100,
-                );
+                let mut changed = false;
+                let mut all_success = true;
 
-                // 2. Ghi giá trị EPP mới vào Windows Power Scheme cho cả AC và DC
-                let write_epp_ac = PowerWriteACValueIndex(
-                    None,
-                    scheme,
-                    Some(&GUID_PROCESSOR_SETTINGS_SUBGROUP),
-                    Some(&GUID_PROCESSOR_PERF_ENERGY_PERFORMANCE_PREFERENCE),
-                    epp_val,
-                );
-                let write_epp_dc = PowerWriteDCValueIndex(
-                    None,
-                    scheme,
-                    Some(&GUID_PROCESSOR_SETTINGS_SUBGROUP),
-                    Some(&GUID_PROCESSOR_PERF_ENERGY_PERFORMANCE_PREFERENCE),
-                    epp_val,
-                );
+                if self.last_applied_throttle_max != throttle_max {
+                    let write_max_ac = PowerWriteACValueIndex(
+                        None,
+                        scheme,
+                        Some(&GUID_PROCESSOR_SETTINGS_SUBGROUP),
+                        Some(&GUID_PROCESSOR_THROTTLE_MAXIMUM),
+                        throttle_max,
+                    );
+                    let write_max_dc = PowerWriteDCValueIndex(
+                        None,
+                        scheme,
+                        Some(&GUID_PROCESSOR_SETTINGS_SUBGROUP),
+                        Some(&GUID_PROCESSOR_THROTTLE_MAXIMUM),
+                        throttle_max,
+                    );
+                    if write_max_ac.0 == 0 && write_max_dc == 0 {
+                        self.last_applied_throttle_max = throttle_max;
+                        changed = true;
+                    } else {
+                        all_success = false;
+                    }
+                }
 
-                // 3. Kích hoạt scheme ngay lập tức để Windows áp dụng
-                let apply_res = PowerSetActiveScheme(None, Some(scheme));
+                if self.last_applied_epp != epp_val {
+                    let write_epp_ac = PowerWriteACValueIndex(
+                        None,
+                        scheme,
+                        Some(&GUID_PROCESSOR_SETTINGS_SUBGROUP),
+                        Some(&GUID_PROCESSOR_PERF_ENERGY_PERFORMANCE_PREFERENCE),
+                        epp_val,
+                    );
+                    let write_epp_dc = PowerWriteDCValueIndex(
+                        None,
+                        scheme,
+                        Some(&GUID_PROCESSOR_SETTINGS_SUBGROUP),
+                        Some(&GUID_PROCESSOR_PERF_ENERGY_PERFORMANCE_PREFERENCE),
+                        epp_val,
+                    );
+                    if write_epp_ac.0 == 0 && write_epp_dc == 0 {
+                        self.last_applied_epp = epp_val;
+                        changed = true;
+                    } else {
+                        all_success = false;
+                    }
+                }
 
-                write_max_ac.0 == 0
-                    && write_max_dc == 0
-                    && write_epp_ac.0 == 0
-                    && write_epp_dc == 0
-                    && apply_res.0 == 0
+                if changed {
+                    let apply_res = PowerSetActiveScheme(None, Some(scheme));
+                    if apply_res.0 != 0 {
+                        all_success = false;
+                    }
+                }
+
+                all_success
             }
         } else {
             false
         }
     }
 
-    /// Khôi phục CPU về hiệu năng tối đa (EPP = 0, PROCTHROTTLEMAX = 100%).
-    /// Đảm bảo CPU hoạt động ở mức Turbo Boost cao nhất sau khi đóng ứng dụng hoặc tắt governor.
-    pub fn reset_to_maximum(&mut self) {
-        self.current_epp = 0;
-        self.prev_cpu_temp = None;
-        self.apply_epp(0);
+    /// Tương thích ngược: Áp dụng giá trị EPP với mức Throttle hiện tại.
+    pub fn apply_epp(&mut self, epp_val: u32) -> bool {
+        self.apply_power_settings(self.current_throttle_max, epp_val)
     }
 
-    /// Khôi phục mức EPP về giá trị ban đầu trước khi ứng dụng khởi chạy.
-    pub fn reset_to_original(&mut self) {
-        self.current_epp = self.original_epp;
+    /// Khôi phục trạng thái vi xử lý về mức an toàn / gốc của hệ điều hành:
+    /// - PROCTHROTTLEMAX = 100% (Mở lại Turbo Boost hoàn toàn)
+    /// - PERFEPP = original_epp (nếu > 0) hoặc 50 (Windows Balanced mặc định)
+    pub fn reset_to_maximum(&mut self) {
+        self.current_throttle_max = 100;
+        let restore_epp = if self.original_epp > 0 { self.original_epp } else { 50 };
+        self.current_epp = restore_epp;
         self.prev_cpu_temp = None;
-        self.apply_epp(self.original_epp);
+        self.apply_power_settings(100, restore_epp);
+    }
+
+    /// Khôi phục mức EPP và Throttle về giá trị ban đầu trước khi ứng dụng khởi chạy.
+    pub fn reset_to_original(&mut self) {
+        self.reset_to_maximum();
     }
 }
 
 impl Drop for ThermalGovernor {
-    /// Khi ThermalGovernor bị giải phóng bộ nhớ (Drop), tự động khôi phục EPP = 0 và PROCTHROTTLEMAX = 100%.
+    /// Khi ThermalGovernor bị giải phóng bộ nhớ (Drop), tự động khôi phục PROCTHROTTLEMAX = 100%
+    /// và PERFEPP = original_epp (hoặc 50) để đảm bảo CPU không bị kẹt ở trạng thái giảm hiệu năng.
     fn drop(&mut self) {
         self.reset_to_maximum();
     }
@@ -379,41 +487,94 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_asymmetric_attack_immediate_reaction() {
-        let config = ThermalGovernorConfig {
-            enabled: true,
-            target_temp: 75,
-            tolerance: 0,
-            max_epp: 90,
-        };
+    fn test_emergency_turbo_cut_when_near_target() {
+        let target = 75;
+        let max_epp = 90;
 
-        // Kịch bản 1: Vượt +1°C (76°C) phản ứng tức thì lên tối thiểu 45
-        let mut gov1 = ThermalGovernor::new_test(config);
-        assert_eq!(gov1.current_epp, 0);
-        let res_76 = gov1.update(76);
-        assert_eq!(res_76, 45, "+1°C (76°C) phải kích hoạt Proportional Attack nhảy tức thì lên EPP 45");
-        // Nếu tiếp tục ở 76°C chu kỳ sau (vẫn vượt 1°C), tăng tiếp +15
-        let res_76_next = gov1.update(76);
-        assert_eq!(res_76_next, 60, "Tiếp tục vượt +1°C chu kỳ 2 phải cộng dồn +15 lên 60");
+        // 1. T_now = 74 (chạm mốc target - 1): Kích hoạt ngay ngắt Turbo và đặt EPP = 90
+        let (throttle, epp) = ThermalGovernor::calculate_next_state(100, 30, 74, None, target, max_epp);
+        assert_eq!(throttle, 99, "T_now = target - 1 (74°C) phải ngắt Turbo (PROCTHROTTLEMAX = 99)");
+        assert_eq!(epp, 90, "T_now = target - 1 phải đặt EPP = 90");
 
-        // Kịch bản 2: Vượt +2°C (77°C) phản ứng tức thì lên tối thiểu 65
-        let mut gov2 = ThermalGovernor::new_test(config);
-        let res_77 = gov2.update(77);
-        assert_eq!(res_77, 65, "+2°C (77°C) phải kích hoạt Hard Throttle nhảy tức thì lên EPP 65");
+        // 2. T_now = 75 (bằng target): Ngắt Turbo và EPP = 90
+        let (throttle_75, epp_75) = ThermalGovernor::calculate_next_state(100, 30, 75, None, target, max_epp);
+        assert_eq!(throttle_75, 99);
+        assert_eq!(epp_75, 90);
 
-        // Kịch bản 3: Vượt +3°C (78°C) phản ứng khẩn cấp Emergency Clamp lên 85
-        let mut gov3 = ThermalGovernor::new_test(config);
-        let res_78 = gov3.update(78);
-        assert_eq!(res_78, 85, "+3°C (78°C) phải kích hoạt Emergency Clamp nhảy tức thì lên EPP 85");
-
-        // Kịch bản 4: Vượt rất cao (>= +3°C, ví dụ 85°C) nhảy tức thì lên 85
-        let mut gov4 = ThermalGovernor::new_test(config);
-        let res_85 = gov4.update(85);
-        assert_eq!(res_85, 85, "Quá nhiệt nặng (85°C) phải Emergency Clamp ngay lập tức ở 85");
+        // 3. T_now = 80 (vượt target): Ngắt Turbo và EPP = 90
+        let (throttle_80, epp_80) = ThermalGovernor::calculate_next_state(100, 30, 80, None, target, max_epp);
+        assert_eq!(throttle_80, 99);
+        assert_eq!(epp_80, 90);
     }
 
     #[test]
-    fn test_spike_rate_of_rise_at_target_temp() {
+    fn test_predictive_turbo_cut_on_thermal_spike() {
+        let target = 75;
+        let max_epp = 90;
+
+        // Kịch bản: T_now = 72°C (chưa chạm target - 1 = 74°C), nhưng tốc độ tăng nhiệt rất dốc:
+        // T_prev = 68°C -> delta = +4°C -> T_pred = 72 + 2 * 4 = 80°C >= target + 1 (76°C)
+        let (throttle, epp) = ThermalGovernor::calculate_next_state(100, 30, 72, Some(68), target, max_epp);
+        assert_eq!(throttle, 99, "Spike dốc (T_pred = 80 >= 76) phải đón đầu ngắt ngay Turbo Boost");
+        assert_eq!(epp, 90, "Spike dốc phải ép EPP lên 90");
+
+        // Kịch bản: T_now = 71°C, T_prev = 70°C (delta = +1°C) -> T_pred = 71 + 2 = 73 < 76°C
+        // Không kích hoạt Turbo Cut, điều biến tuyến tính
+        let (throttle_normal, epp_normal) = ThermalGovernor::calculate_next_state(100, 30, 71, Some(70), target, max_epp);
+        assert_eq!(throttle_normal, 100, "Tăng chậm dưới ngưỡng không được ngắt Turbo");
+        assert_eq!(epp_normal, 75, "T_now = 71 (target - 4) có EPP = 75");
+    }
+
+    #[test]
+    fn test_hysteresis_turbo_cut_retention_and_recovery() {
+        let target = 75;
+        let max_epp = 90;
+
+        // Đang trong trạng thái Turbo Cut (throttle = 99, epp = 90)
+        // 1. Làm mát về 73°C (> target - 4 = 71°C): Vẫn phải giữ nguyên Turbo Cut
+        let (throttle_73, epp_73) = ThermalGovernor::calculate_next_state(99, 90, 73, Some(75), target, max_epp);
+        assert_eq!(throttle_73, 99, "73°C > 71°C chưa đủ điều kiện thoát Hysteresis, phải giữ Turbo Cut");
+        assert_eq!(epp_73, 90);
+
+        // 2. Làm mát về 72°C (> 71°C): Vẫn giữ nguyên Turbo Cut
+        let (throttle_72, epp_72) = ThermalGovernor::calculate_next_state(99, 90, 72, Some(73), target, max_epp);
+        assert_eq!(throttle_72, 99);
+        assert_eq!(epp_72, 90);
+
+        // 3. Làm mát an toàn về 71°C (<= target - 4): Thoát Turbo Cut, khôi phục 100% Throttle và EPP = 75
+        let (throttle_71, epp_71) = ThermalGovernor::calculate_next_state(99, 90, 71, Some(72), target, max_epp);
+        assert_eq!(throttle_71, 100, "71°C (target - 4) đã hạ an toàn, khôi phục PROCTHROTTLEMAX = 100");
+        assert_eq!(epp_71, 75, "Tại target - 4, EPP điều biến về 75");
+
+        // 4. Tiếp tục làm mát về 67°C (target - 8): Throttle = 100, EPP = 53
+        let (throttle_67, epp_67) = ThermalGovernor::calculate_next_state(100, 75, 67, Some(71), target, max_epp);
+        assert_eq!(throttle_67, 100);
+        assert_eq!(epp_67, 53);
+    }
+
+    #[test]
+    fn test_linear_epp_modulation_safe_zone() {
+        let target = 75;
+        let max_epp = 90;
+
+        // Cách xa mục tiêu >= 12°C: EPP = 30
+        assert_eq!(ThermalGovernor::calculate_linear_epp(63, target, max_epp), 30, "target - 12 (63°C) -> EPP = 30");
+        assert_eq!(ThermalGovernor::calculate_linear_epp(50, target, max_epp), 30, "Mát sâu (50°C) -> EPP = 30");
+        assert_eq!(ThermalGovernor::calculate_linear_epp(35, target, max_epp), 30, "Idle mát lạnh (35°C) -> EPP = 30");
+
+        // Dải tuyến tính giữa target - 12 (63°C) và target - 4 (71°C)
+        assert_eq!(ThermalGovernor::calculate_linear_epp(65, target, max_epp), 41, "dist = 10 -> EPP = 41");
+        assert_eq!(ThermalGovernor::calculate_linear_epp(67, target, max_epp), 53, "dist = 8 -> EPP = 53");
+        assert_eq!(ThermalGovernor::calculate_linear_epp(69, target, max_epp), 64, "dist = 6 -> EPP = 64");
+        assert_eq!(ThermalGovernor::calculate_linear_epp(71, target, max_epp), 75, "dist = 4 -> EPP = 75");
+
+        // Khi tiệm cận mục tiêu (dist = 3, 2)
+        assert_eq!(ThermalGovernor::calculate_linear_epp(72, target, max_epp), 78, "dist = 3 -> EPP = 78");
+        assert_eq!(ThermalGovernor::calculate_linear_epp(73, target, max_epp), 81, "dist = 2 -> EPP = 81");
+    }
+
+    #[test]
+    fn test_governor_update_stateful_lifecycle() {
         let config = ThermalGovernorConfig {
             enabled: true,
             target_temp: 75,
@@ -422,152 +583,91 @@ mod tests {
         };
 
         let mut governor = ThermalGovernor::new_test(config);
-
-        // Chu kỳ 1: Nhiệt độ mát 70°C -> EPP = 0, ghi nhận prev = 70
-        assert_eq!(governor.update(70), 0);
-        assert_eq!(governor.prev_cpu_temp, Some(70));
-
-        // Chu kỳ 2: Spike vọt dốc từ 70°C lên đúng 75°C (diff = 0, rate = +5 > 0)
-        // Pre-emptive Hold phải phát hiện đà tăng và hãm trước +8 EPP
-        let res_spike = governor.update(75);
-        assert_eq!(res_spike, 8, "Spike dốc khi chạm 75°C phải Pre-emptive Hold tăng EPP +8 đón đầu");
-        assert_eq!(governor.prev_cpu_temp, Some(75));
-
-        // Chu kỳ 3: Nhiệt độ đứng yên tại 75°C (diff = 0, rate = 0 <= 0)
-        // Không tăng thêm, giữ nguyên EPP = 8
-        let res_steady = governor.update(75);
-        assert_eq!(res_steady, 8, "Đứng yên tại target temp phải giữ nguyên EPP để ổn định");
-
-        // Chu kỳ 4: Chớm hạ về 74°C (diff = -1) -> Vùng đệm chống rung xung nhịp
-        let res_74 = governor.update(74);
-        assert_eq!(res_74, 8, "74°C (diff = -1) là vùng đệm chống rung, giữ nguyên EPP");
-
-        // Chu kỳ 5: Lại bật tăng từ 74°C lên 75°C (diff = 0, rate = +1 > 0)
-        let res_spike_again = governor.update(75);
-        assert_eq!(res_spike_again, 16, "Bật tăng từ 74 lên 75 (rate > 0) phải kích hoạt Pre-emptive Hold +8 lên 16");
-
-        // Chu kỳ 6: Quá nhiệt chớm 76°C (diff = +1)
-        let res_76 = governor.update(76);
-        assert_eq!(res_76, 45, "Chớm quá 76°C kích hoạt Proportional Attack nhảy lên sàn 45");
-
-        // Chu kỳ 7: Hạ nhiệt từ 76°C về 75°C (diff = 0, rate = -1 <= 0)
-        // Nhiệt độ đang hạ về target nên KHÔNG kích hoạt Pre-emptive Hold, giữ nguyên 45
-        let res_cool_target = governor.update(75);
-        assert_eq!(res_cool_target, 45, "Hạ nhiệt về 75°C (rate < 0) phải giữ nguyên EPP = 45");
-    }
-
-    #[test]
-    fn test_deadband_stability() {
-        let config = ThermalGovernorConfig {
-            enabled: true,
-            target_temp: 75,
-            tolerance: 0,
-            max_epp: 90,
-        };
-
-        let mut governor = ThermalGovernor::new_test(config);
-        governor.current_epp = 50;
-
-        // diff = -1 (74°C): Vùng đệm chống dao động xung nhịp
-        assert_eq!(governor.update(74), 50, "74°C (diff = -1) phải giữ nguyên EPP");
-        assert_eq!(governor.update(74), 50, "74°C chu kỳ tiếp theo vẫn giữ nguyên EPP");
-
-        // Khi nhiệt độ ở đúng target (75°C) và không tăng (rate <= 0):
-        // Giả lập từ 75°C sang 75°C
-        assert_eq!(governor.update(75), 58); // rate = 75 - 74 = +1 > 0 -> 50 + 8 = 58
-        assert_eq!(governor.update(75), 58); // rate = 75 - 75 = 0 <= 0 -> giữ nguyên 58
-    }
-
-    #[test]
-    fn test_smooth_recovery_below_target() {
-        let config = ThermalGovernorConfig {
-            enabled: true,
-            target_temp: 75,
-            tolerance: 0,
-            max_epp: 90,
-        };
-
-        let mut governor = ThermalGovernor::new_test(config);
-        governor.current_epp = 40;
-
-        // 1. diff = -2 (73°C): Smooth recovery giảm nhẹ EPP -3
-        let res_73 = governor.update(73);
-        assert_eq!(res_73, 37, "73°C (diff = -2) phải giảm nhẹ EPP -3 từ 40 xuống 37");
-
-        // 2. diff = -3 (72°C): Smooth recovery tiếp tục giảm -3
-        let res_72 = governor.update(72);
-        assert_eq!(res_72, 34, "72°C (diff = -3) phải giảm nhẹ EPP -3 từ 37 xuống 34");
-
-        // 3. diff = -4 (71°C <= -4): Rất mát, giảm nhanh EPP -5
-        let res_71 = governor.update(71);
-        assert_eq!(res_71, 29, "71°C (diff = -4) phải giảm nhanh EPP -5 từ 34 xuống 29");
-
-        // 4. Rất mát sâu (60°C <= -4): Giảm nhanh EPP -5
-        let res_60 = governor.update(60);
-        assert_eq!(res_60, 24, "60°C phải tiếp tục giảm nhanh EPP -5 từ 29 xuống 24");
-
-        // 5. Giảm dần về sàn 0 và không bị âm
-        for _ in 0..10 {
-            governor.update(50);
-        }
-        assert_eq!(governor.current_epp, 0, "Phục hồi hoàn toàn về sàn EPP = 0");
-    }
-
-    #[test]
-    fn test_epp_clamping() {
-        let config = ThermalGovernorConfig {
-            enabled: true,
-            target_temp: 75,
-            tolerance: 0,
-            max_epp: 90,
-        };
-
-        let mut governor = ThermalGovernor::new_test(config);
-
-        // Kẹp trần tại max_epp = 90
-        governor.current_epp = 80;
-        let res = governor.update(77); // diff = 2 -> 80 + 25 = 105 -> clamped to 90
-        assert_eq!(res, 90, "EPP không được vượt quá max_epp = 90");
-        assert_eq!(governor.current_epp, 90);
-
-        // Tiếp tục quá nhiệt khi đã ở trần 90
-        let res_ceiling = governor.update(85); // diff >= 3 -> 90.max(85).min(90) = 90
-        assert_eq!(res_ceiling, 90, "Khi đã ở trần 90, EPP được giữ nguyên");
-
-        // Kẹp sàn tại 0
-        governor.current_epp = 2;
-        let res_min = governor.update(50); // diff <= -4 -> 2.saturating_sub(5) = 0
-        assert_eq!(res_min, 0, "EPP không được giảm dưới sàn 0");
+        assert_eq!(governor.current_throttle_max, 100);
         assert_eq!(governor.current_epp, 0);
 
-        let res_floor = governor.update(45);
-        assert_eq!(res_floor, 0, "Khi đã ở sàn 0, không bao giờ giảm thêm");
+        // 1. T_now = 60°C: Cách xa mục tiêu (> 12°C) -> Throttle = 100, EPP = 30
+        assert_eq!(governor.update(60), 30);
+        assert_eq!(governor.current_throttle_max, 100);
+        assert!(!governor.is_turbo_cut());
+
+        // 2. Tăng nhiệt từ từ: 65°C rồi lên 67°C (delta = +2 -> T_pred = 67 + 4 = 71 < 76)
+        governor.update(65);
+        assert_eq!(governor.update(67), 53);
+        assert_eq!(governor.current_throttle_max, 100);
+
+        // 3. Tăng tiếp từ từ: 69°C rồi lên 71°C (delta = +2 -> T_pred = 71 + 4 = 75 < 76)
+        governor.update(69);
+        assert_eq!(governor.update(71), 75);
+        assert_eq!(governor.current_throttle_max, 100);
+
+        // 4. Spike nhảy từ 71°C lên 74°C (delta = +3 -> T_pred = 74 + 6 = 80 >= 76)
+        // và 74 == target - 1 -> Ngắt Turbo tức thì!
+        assert_eq!(governor.update(74), 90);
+        assert_eq!(governor.current_throttle_max, 99);
+        assert!(governor.is_turbo_cut());
+
+        // 5. Làm mát dần: 73°C -> Vẫn giữ Turbo Cut do Hysteresis
+        assert_eq!(governor.update(73), 90);
+        assert_eq!(governor.current_throttle_max, 99);
+
+        // 6. Làm mát tiếp: 72°C -> Vẫn giữ Turbo Cut
+        assert_eq!(governor.update(72), 90);
+        assert_eq!(governor.current_throttle_max, 99);
+
+        // 7. Làm mát an toàn: 71°C (target - 4) -> Mở lại Turbo Boost và EPP = 75
+        assert_eq!(governor.update(71), 75);
+        assert_eq!(governor.current_throttle_max, 100);
+        assert!(!governor.is_turbo_cut());
+
+        // 8. Tiếp tục mát: 63°C -> EPP = 30
+        assert_eq!(governor.update(63), 30);
+        assert_eq!(governor.current_throttle_max, 100);
     }
 
     #[test]
-    fn test_governor_disabled_reset() {
-        let mut config = ThermalGovernorConfig::default();
-        config.enabled = false;
-
+    fn test_power_api_caching_and_avoiding_spam() {
+        let config = ThermalGovernorConfig::default();
         let mut governor = ThermalGovernor::new_test(config);
-        governor.current_epp = 45;
-        governor.prev_cpu_temp = Some(80);
 
-        // Khi governor bị tắt, update phải tự khôi phục về EPP = 0 và reset prev_cpu_temp về None
-        let res = governor.update(95);
-        assert_eq!(res, 0);
-        assert_eq!(governor.current_epp, 0);
-        assert_eq!(governor.prev_cpu_temp, None);
+        governor.last_applied_throttle_max = 100;
+        governor.last_applied_epp = 50;
+
+        // Gọi apply với cùng giá trị: không làm gì, trả về true
+        assert!(governor.apply_power_settings(100, 50));
+        assert_eq!(governor.last_applied_throttle_max, 100);
+        assert_eq!(governor.last_applied_epp, 50);
+
+        // Thay đổi giá trị: cập nhật cache
+        assert!(governor.apply_power_settings(99, 90));
+        assert_eq!(governor.last_applied_throttle_max, 99);
+        assert_eq!(governor.last_applied_epp, 90);
     }
 
     #[test]
-    fn test_reset_to_maximum() {
+    fn test_fail_safe_cleanup_and_drop() {
         let mut governor = ThermalGovernor::new_test(ThermalGovernorConfig::default());
-        governor.current_epp = 65;
-        governor.prev_cpu_temp = Some(78);
+        governor.original_epp = 50;
+        governor.current_throttle_max = 99;
+        governor.current_epp = 90;
+        governor.prev_cpu_temp = Some(75);
+
+        // Gọi reset_to_maximum: phải khôi phục 100% Throttle và EPP = original_epp (50)
         governor.reset_to_maximum();
-        assert_eq!(governor.current_epp, 0);
+        assert_eq!(governor.current_throttle_max, 100);
+        assert_eq!(governor.current_epp, 50);
         assert_eq!(governor.prev_cpu_temp, None);
+        assert_eq!(governor.last_applied_throttle_max, 100);
+        assert_eq!(governor.last_applied_epp, 50);
+
+        // Kiểm tra khi governor bị disabled trong update()
+        governor.config.enabled = false;
+        governor.current_throttle_max = 99;
+        governor.current_epp = 90;
+        let res = governor.update(85);
+        assert_eq!(res, 50);
+        assert_eq!(governor.current_throttle_max, 100);
+        assert_eq!(governor.current_epp, 50);
     }
 
     #[test]
@@ -577,42 +677,5 @@ mod tests {
         assert_eq!(cfg.target_temp, 80);
         assert_eq!(cfg.tolerance, 0);
         assert_eq!(cfg.max_epp, 90);
-    }
-
-    #[test]
-    fn test_pure_calculate_next_epp_branches() {
-        // diff >= 3: Emergency Clamp
-        assert_eq!(ThermalGovernor::calculate_next_epp(0, 78, None, 75, 90), 85);
-        assert_eq!(ThermalGovernor::calculate_next_epp(70, 78, None, 75, 90), 85);
-        assert_eq!(ThermalGovernor::calculate_next_epp(90, 80, None, 75, 90), 90);
-
-        // diff == 2: Hard Throttle (saturating_add 25, min 65)
-        assert_eq!(ThermalGovernor::calculate_next_epp(0, 77, None, 75, 90), 65);
-        assert_eq!(ThermalGovernor::calculate_next_epp(50, 77, None, 75, 90), 75);
-        assert_eq!(ThermalGovernor::calculate_next_epp(80, 77, None, 75, 90), 90);
-
-        // diff == 1: Proportional Attack (saturating_add 15, min 45)
-        assert_eq!(ThermalGovernor::calculate_next_epp(0, 76, None, 75, 90), 45);
-        assert_eq!(ThermalGovernor::calculate_next_epp(45, 76, None, 75, 90), 60);
-        assert_eq!(ThermalGovernor::calculate_next_epp(80, 76, None, 75, 90), 90);
-
-        // diff == 0:
-        // rate > 0 (dT/dt > 0): Pre-emptive Hold (+8)
-        assert_eq!(ThermalGovernor::calculate_next_epp(10, 75, Some(72), 75, 90), 18);
-        // rate <= 0: Hold
-        assert_eq!(ThermalGovernor::calculate_next_epp(20, 75, Some(75), 75, 90), 20);
-        assert_eq!(ThermalGovernor::calculate_next_epp(20, 75, Some(77), 75, 90), 20);
-        assert_eq!(ThermalGovernor::calculate_next_epp(20, 75, None, 75, 90), 20);
-
-        // diff == -1: Deadband buffer (hold)
-        assert_eq!(ThermalGovernor::calculate_next_epp(30, 74, Some(75), 75, 90), 30);
-
-        // diff == -2 hoặc -3: Smooth recovery (-3)
-        assert_eq!(ThermalGovernor::calculate_next_epp(30, 73, None, 75, 90), 27);
-        assert_eq!(ThermalGovernor::calculate_next_epp(30, 72, None, 75, 90), 27);
-
-        // diff <= -4: Fast recovery (-5)
-        assert_eq!(ThermalGovernor::calculate_next_epp(30, 71, None, 75, 90), 25);
-        assert_eq!(ThermalGovernor::calculate_next_epp(30, 60, None, 75, 90), 25);
     }
 }
